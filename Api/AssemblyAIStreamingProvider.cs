@@ -168,13 +168,48 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
         _ws = new ClientWebSocket();
         _readyTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        await _ws.ConnectAsync(url, ct).ConfigureAwait(false);
+        AppDebugLog.Write($"AssemblyAI: connecting WebSocket to {url.Host}…");
+
+        // ConnectAsync has been observed to hang indefinitely on some networks if the TLS/socket never completes,
+        // which leaves VoiceState stuck on Processing with no Listening waveform.
+        using (var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+        {
+            connectCts.CancelAfter(TimeSpan.FromSeconds(30));
+            try
+            {
+                await _ws.ConnectAsync(url, connectCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                TryAbortSocket();
+                throw new TimeoutException(
+                    $"Timed out connecting to AssemblyAI ({url.Host}) after 30s. Try another network/VPN or check firewall blocking wss.");
+            }
+        }
+
+        AppDebugLog.Write("AssemblyAI: socket open, awaiting session Begin frame…");
 
         // Start the receive loop in the background
         _ = Task.Run(() => ReceiveLoopAsync(CancellationToken.None));
 
-        // Wait until the server sends the "begin" message (or error)
-        await _readyTcs.Task.WaitAsync(TimeSpan.FromSeconds(15), ct).ConfigureAwait(false);
+        try
+        {
+            await _readyTcs.Task.WaitAsync(TimeSpan.FromSeconds(45), ct).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            TryAbortSocket();
+            throw new TimeoutException(
+                "AssemblyAI opened the socket but never sent a Begin/control frame within 45s.");
+        }
+
+        AppDebugLog.Write("AssemblyAI: Begin received — ready for audio.");
+
+        void TryAbortSocket()
+        {
+            try { _ws?.Abort(); }
+            catch { /* no-op */ }
+        }
     }
 
     // ── Audio ─────────────────────────────────────────────────────────────────
@@ -264,7 +299,9 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
 
             switch (type)
             {
+                // Universal Streaming historically uses "Begin"; tolerate alternate envelopes if API evolves.
                 case "begin":
+                case "sessionbegins":
                     ResolveReadyIfNeeded(success: true);
                     break;
 
@@ -276,11 +313,7 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
 
                 case "termination":
                     ResolveReadyIfNeeded(success: true);
-                    lock (_stateLock)
-                    {
-                        if (_isAwaitingExplicit && !_hasDeliveredFinalTranscript)
-                            DeliverFinalTranscriptIfNeeded(BestAvailableTranscript());
-                    }
+                    TryDeliverTerminationTranscript();
                     break;
 
                 case "error":
@@ -288,6 +321,11 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
                               ?? throw new JsonException("Error message deserialization returned null.");
                     var msg = err.Error ?? err.Message ?? "AssemblyAI returned an error.";
                     FailSession(new InvalidOperationException(msg));
+                    break;
+
+                default:
+                    if (!string.IsNullOrWhiteSpace(type))
+                        AppDebugLog.Write($"AssemblyAI: ignored websocket message type \"{type}\"");
                     break;
             }
         }
@@ -302,6 +340,7 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
     private void HandleTurnMessage(AaiTurnMessage turn)
     {
         var transcriptText = turn.Transcript?.Trim() ?? "";
+        var endTurn = turn.EndOfTurn == true || turn.TurnIsFormatted == true;
 
         lock (_stateLock)
         {
@@ -309,9 +348,9 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
                             ?? _activeTurnOrder
                             ?? ((_storedTurns.Keys.Count > 0 ? _storedTurns.Keys.Max() : -1) + 1);
 
-            var endOfTurn = turn.EndOfTurn == true || turn.TurnIsFormatted == true;
+            var endOfTurnLocked = turn.EndOfTurn == true || turn.TurnIsFormatted == true;
 
-            if (endOfTurn)
+            if (endOfTurnLocked)
             {
                 _activeTurnOrder = null;
                 _activeTurnText = "";
@@ -328,16 +367,26 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
 
             if (!string.IsNullOrEmpty(full))
                 _onTranscriptUpdate(full);
-
-            if (!_isAwaitingExplicit) return;
-
-            if (endOfTurn)
-            {
-                _gracePeriodCts?.Cancel();
-                _gracePeriodCts = null;
-                DeliverFinalTranscriptIfNeeded(BestAvailableTranscript());
-            }
         }
+
+        // Never call _onFinalTranscriptReady (Dispatcher.Invoke) while holding _stateLock — the UI thread can
+        // call Cancel()/lock the same mutex (e.g. fallback timer), deadlocking forever with no transcript.
+        if (!endTurn)
+            return;
+
+        string snapshot;
+        lock (_stateLock)
+        {
+            if (!_isAwaitingExplicit || _hasDeliveredFinalTranscript)
+                return;
+
+            _gracePeriodCts?.Cancel();
+            _gracePeriodCts = null;
+
+            snapshot = BestAvailableTranscript();
+        }
+
+        DeliverFinalTranscriptIfNeeded(snapshot);
     }
 
     private void StoreTurn(string text, int order, bool isFormatted)
@@ -389,22 +438,52 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
             }
             catch (OperationCanceledException) { return; }
 
+            string snapshot;
             lock (_stateLock)
             {
-                DeliverFinalTranscriptIfNeeded(BestAvailableTranscript());
+                if (!_isAwaitingExplicit || _hasDeliveredFinalTranscript)
+                    return;
+                snapshot = BestAvailableTranscript();
             }
+
+            DeliverFinalTranscriptIfNeeded(snapshot);
         });
     }
 
+    private void TryDeliverTerminationTranscript()
+    {
+        string snapshot;
+        lock (_stateLock)
+        {
+            if (!_isAwaitingExplicit || _hasDeliveredFinalTranscript)
+                return;
+            snapshot = BestAvailableTranscript();
+        }
+
+        DeliverFinalTranscriptIfNeeded(snapshot);
+    }
+
+    /// <summary>
+    /// Claims final delivery exactly once and invokes UI callback without holding <see cref="_stateLock"/>.
+    /// </summary>
     private void DeliverFinalTranscriptIfNeeded(string text)
     {
-        // Must be called under _stateLock
-        if (_hasDeliveredFinalTranscript) return;
-        _hasDeliveredFinalTranscript = true;
-        _gracePeriodCts?.Cancel();
-        _gracePeriodCts = null;
-        _onFinalTranscriptReady(text);
-        _ = SendJsonAsync(new { type = "Terminate" });
+        lock (_stateLock)
+        {
+            if (_hasDeliveredFinalTranscript) return;
+            _hasDeliveredFinalTranscript = true;
+            _gracePeriodCts?.Cancel();
+            _gracePeriodCts = null;
+        }
+
+        try
+        {
+            _onFinalTranscriptReady(text);
+        }
+        finally
+        {
+            _ = SendJsonAsync(new { type = "Terminate" });
+        }
     }
 
     // ── Error handling ────────────────────────────────────────────────────────
@@ -413,18 +492,18 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
     {
         ResolveReadyIfNeeded(success: false, ex);
 
+        string? partial = null;
         lock (_stateLock)
         {
             if (_isAwaitingExplicit && !_hasDeliveredFinalTranscript)
-            {
-                var partial = BestAvailableTranscript();
-                if (!string.IsNullOrEmpty(partial))
-                {
-                    Console.WriteLine($"[AssemblyAI] ⚠️ WebSocket error during session, delivering partial: {ex.Message}");
-                    DeliverFinalTranscriptIfNeeded(partial);
-                    return;
-                }
-            }
+                partial = BestAvailableTranscript();
+        }
+
+        if (!string.IsNullOrEmpty(partial))
+        {
+            Console.WriteLine($"[AssemblyAI] ⚠️ WebSocket error during session, delivering partial: {ex.Message}");
+            DeliverFinalTranscriptIfNeeded(partial);
+            return;
         }
 
         Console.WriteLine($"[AssemblyAI] ❌ Session failed: {ex.Message}");

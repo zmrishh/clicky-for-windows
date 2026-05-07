@@ -30,8 +30,10 @@ internal static class AppConstants
 
     // AssemblyAI
     public const string AssemblyAiWebSocketBase = "wss://streaming.assemblyai.com/v3/ws";
-    public const double AssemblyAiExplicitFinalGracePeriodSeconds = 1.4;
-    public const double AssemblyAiFallbackDelaySeconds = 2.8;
+    /// <summary>After ForceEndpoint, wait this long before delivering best-effort transcript if no end_turn.</summary>
+    public const double AssemblyAiExplicitFinalGracePeriodSeconds = 2.2;
+    /// <summary>If the streaming session never calls OnFinalTranscriptReady this long after key-up, abandon it.</summary>
+    public const double AssemblyAiFallbackDelaySeconds = 8.0;
 
     // Overlay
     public const double CursorOffsetX = 35.0;

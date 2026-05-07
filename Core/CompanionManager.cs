@@ -410,13 +410,19 @@ public sealed class CompanionManager : IDisposable
 
         Task.Run(async () =>
         {
+            using var prepareTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(75));
+            var ct = prepareTimeout.Token;
+
             try
             {
+                AppDebugLog.Write("PTT: fetching streaming token + opening AssemblyAI websocket…");
+
                 var session = await _assemblyAiProvider.StartSessionAsync(
                     keyterms: BuildKeyterms(),
                     onTranscriptUpdate: _ => { },
                     onFinalTranscriptReady: OnFinalTranscriptReady,
-                    onError: OnTranscriptionError);
+                    onError: OnTranscriptionError,
+                    ct);
 
                 await WpfApp.Current.Dispatcher.InvokeAsync(() =>
                 {
@@ -429,20 +435,66 @@ public sealed class CompanionManager : IDisposable
                     _activeSession = session;
                     _isRecording = true;
                     _isPreparing = false;
-                    _audioCapture.Start();
+
+                    // Switch to waveform ASAP; microphone errors are handled separately below.
                     VoiceState = VoiceState.Listening;
-                    AppDebugLog.Write("AssemblyAI session ready → recording (listening).");
+
+                    try
+                    {
+                        _audioCapture.Start();
+                        AppDebugLog.Write("AssemblyAI session ready → recording (listening).");
+                    }
+                    catch (Exception micEx)
+                    {
+                        AppDebugLog.Write($"PTT: microphone pipeline failed after session opened: {micEx}");
+                        _activeSession?.Cancel();
+                        _activeSession = null;
+                        _isRecording = false;
+                        VoiceState = VoiceState.Idle;
+                        ShowDiagnostic(
+                            $"Microphone could not start recording.\r\n\r\n{micEx.Message}\r\n\r\n" +
+                            "Pick a working microphone in Windows Settings → System → Sound → Input, then try Ctrl+Alt again.",
+                            isError: true);
+                    }
+                });
+            }
+            catch (OperationCanceledException) when (prepareTimeout.Token.IsCancellationRequested)
+            {
+                AppDebugLog.Write("PTT: prepare timed out (75s overall) waiting for Worker + AssemblyAI.");
+                await WpfApp.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    _isPreparing = false;
+                    VoiceState = VoiceState.Idle;
+                    ShowDiagnostic(
+                        "Connecting to the speech service took too long.\r\n\r\n" +
+                        "Check Internet, VPN/firewall (outbound WebSocket TLS to streaming.assemblyai.com), Worker URL,\r\n" +
+                        "and `clicky-debug.log` under %AppData%\\Roaming\\Clicky\\.",
+                        isError: true);
+                });
+            }
+            catch (TimeoutException tex)
+            {
+                Console.WriteLine($"[PTT] Timeout: {tex.Message}");
+                await WpfApp.Current.Dispatcher.InvokeAsync(() =>
+                {
+                    _isPreparing = false;
+                    VoiceState = VoiceState.Idle;
+                    ShowDiagnostic(
+                        $"Speech WebSocket timed out:\r\n{tex.Message}\r\n\r\n" +
+                        "Verify your Worker exposes POST /transcribe-token with a valid AssemblyAI key. " +
+                        "If you are on restrictive Wi‑Fi, try another network or VPN.",
+                        isError: true);
                 });
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[PTT] Failed to start session: {ex.Message}");
-                WpfApp.Current.Dispatcher.Invoke(() =>
+                await WpfApp.Current.Dispatcher.InvokeAsync(() =>
                 {
                     _isPreparing = false;
                     VoiceState = VoiceState.Idle;
                     ShowDiagnostic(
-                        $"Could not start transcription (microphone/network or Worker).\n\n{ex.Message}\n\n" +
+                        $"Could not start transcription (microphone/network or Worker).\r\n\r\n{ex.Message}\r\n\r\n" +
                         $"Check your Worker URL in the tray menu and verify AssemblyAI/ElevenLabs secrets on the Worker.",
                         isError: true);
                 });
@@ -464,7 +516,20 @@ public sealed class CompanionManager : IDisposable
         VoiceState = VoiceState.Processing;
 
         _audioCapture.Stop();
-        _activeSession?.RequestFinalTranscript();
+
+        // If the user releases before the WebSocket session is assigned, RequestFinalTranscript is a no-op and
+        // OnFinalTranscriptReady will never run — do NOT start the stall timer (it would false-positive every time).
+        var session = _activeSession;
+        session?.RequestFinalTranscript();
+
+        if (session == null)
+        {
+            AppDebugLog.Write("PTT: released before AssemblyAI session was ready — no final transcript to wait for.");
+            _isFinalizingTranscript = false;
+            VoiceState = VoiceState.Idle;
+            ScheduleTransientHideIfNeeded();
+            return;
+        }
 
         // Fallback: if AssemblyAI doesn't deliver a final transcript in time, give up
         _finalTranscriptFallbackTimer?.Stop();
@@ -551,9 +616,10 @@ public sealed class CompanionManager : IDisposable
 
         var logPath = IoPath.Combine(AppConstants.SettingsDirectory, "clicky-debug.log");
         var msg =
-            "Clicky did not receive a finished transcript from the speech service.\r\n\r\n" +
-            "Try speaking a full sentence before releasing Ctrl+Alt, check your microphone volume, Worker URL,\r\n" +
-            $"and `%AppData%\\Clicky` settings.\r\n\r\nDetails: `{logPath}`";
+            "Clicky timed out waiting for a finished transcript from the speech service.\r\n\r\n" +
+            "Keep Ctrl+Alt held until you see the waveform (listening), speak, then release.\r\n" +
+            "If it still fails: check mic input, Worker URL, and the log file:\r\n" +
+            logPath;
 
         ShowDiagnostic(msg, isError: false);
     }
