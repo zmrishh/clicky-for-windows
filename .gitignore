@@ -1,0 +1,40 @@
+# Build
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+publish/
+out/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.idea/
+*.rsuser
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+
+# NuGet
+*.nupkg
+**/packages/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# Secrets and local config (never commit keys)
+.env
+.env.*
+*.pfx
+secrets.json
+**/appsettings.*.local.json
+**/Properties/launchSettings.json
+
+# Logs and runtime app data (if ever copied into repo)
+clicky-debug.log
+settings.json
+
+# OS
+Thumbs.db
+Desktop.ini

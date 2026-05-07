@@ -1,0 +1,252 @@
+<Window x:Class="ClickyWindows.SystemTray.TrayPopupWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Width="320"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        ShowInTaskbar="False"
+        ShowActivated="False"
+        ResizeMode="NoResize"
+        SizeToContent="Height">
+
+  <Window.Resources>
+    <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+
+    <Style x:Key="SectionLabel" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="10"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Foreground" Value="#6B736F"/>
+      <Setter Property="Margin" Value="0,12,0,6"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+    </Style>
+
+    <Style x:Key="BodyText" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Foreground" Value="#ADB5B2"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+    </Style>
+
+    <Style x:Key="PrimaryText" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="Foreground" Value="#ECEEED"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+    </Style>
+
+    <Style x:Key="StatusRow" TargetType="StackPanel">
+      <Setter Property="Orientation" Value="Horizontal"/>
+      <Setter Property="Margin" Value="0,4,0,0"/>
+    </Style>
+
+    <Style x:Key="PermDot" TargetType="Ellipse">
+      <Setter Property="Width" Value="7"/>
+      <Setter Property="Height" Value="7"/>
+      <Setter Property="Margin" Value="0,0,8,0"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+    </Style>
+
+    <Style x:Key="DarkInput" TargetType="TextBox">
+      <Setter Property="Background" Value="#202221"/>
+      <Setter Property="Foreground" Value="#ECEEED"/>
+      <Setter Property="BorderBrush" Value="#373B39"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="8,6"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+      <Setter Property="CaretBrush" Value="#ECEEED"/>
+    </Style>
+
+    <Style x:Key="DarkCombo" TargetType="ComboBox">
+      <Setter Property="Background" Value="#202221"/>
+      <Setter Property="Foreground" Value="#ECEEED"/>
+      <Setter Property="BorderBrush" Value="#373B39"/>
+      <Setter Property="BorderThickness" Value="1"/>
+      <Setter Property="Padding" Value="8,6"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+    </Style>
+
+    <Style x:Key="ActionButton" TargetType="Button">
+      <Setter Property="Background" Value="#2563EB"/>
+      <Setter Property="Foreground" Value="White"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Padding" Value="0,10"/>
+      <Setter Property="FontSize" Value="14"/>
+      <Setter Property="FontWeight" Value="Medium"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border Background="{TemplateBinding Background}"
+                    CornerRadius="20"
+                    Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <Style x:Key="GhostButton" TargetType="Button">
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Foreground" Value="#ADB5B2"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Padding" Value="0,6"/>
+      <Setter Property="FontSize" Value="12"/>
+      <Setter Property="FontFamily" Value="Segoe UI"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
+              <ContentPresenter HorizontalAlignment="Center"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+  </Window.Resources>
+
+  <!-- Root border with rounded corners and dark background -->
+  <Border Background="#101211"
+          CornerRadius="12"
+          BorderBrush="#373B39"
+          BorderThickness="1"
+          Padding="20,18">
+
+    <Border.Effect>
+      <DropShadowEffect Color="Black" BlurRadius="20" ShadowDepth="4" Opacity="0.55"/>
+    </Border.Effect>
+
+    <StackPanel>
+
+      <!-- Header -->
+      <Grid Margin="0,0,0,4">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+
+        <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+          <!-- Triangle icon -->
+          <Polygon Points="0,-8 -7,6 7,6"
+                   Fill="#3380FF"
+                   Margin="0,0,8,0"
+                   VerticalAlignment="Center">
+            <Polygon.RenderTransform>
+              <TranslateTransform Y="1"/>
+            </Polygon.RenderTransform>
+          </Polygon>
+          <TextBlock Text="Clicky"
+                     FontSize="15"
+                     FontWeight="SemiBold"
+                     Foreground="#ECEEED"
+                     FontFamily="Segoe UI"
+                     VerticalAlignment="Center"/>
+        </StackPanel>
+
+        <TextBlock x:Name="VersionLabel"
+                   Grid.Column="1"
+                   FontSize="11"
+                   Foreground="#6B736F"
+                   FontFamily="Segoe UI"
+                   VerticalAlignment="Center"/>
+      </Grid>
+
+      <!-- Divider -->
+      <Rectangle Height="1" Fill="#373B39" Margin="0,10,0,0"/>
+
+      <!-- ── Permissions ── -->
+      <TextBlock Text="PERMISSIONS" Style="{StaticResource SectionLabel}"/>
+
+      <StackPanel Style="{StaticResource StatusRow}">
+        <Ellipse x:Name="MicDot" Style="{StaticResource PermDot}"/>
+        <TextBlock x:Name="MicLabel" Style="{StaticResource BodyText}"/>
+        <Button x:Name="MicGrantBtn"
+                Content="Grant"
+                Style="{StaticResource GhostButton}"
+                Foreground="#60A5FA"
+                Margin="8,0,0,0"
+                Visibility="Collapsed"
+                Click="OnGrantMicClick"/>
+      </StackPanel>
+
+      <!-- ── Active state ── -->
+      <StackPanel x:Name="AllGrantedPanel" Visibility="Collapsed" Margin="0,10,0,0">
+        <StackPanel Orientation="Horizontal">
+          <Ellipse Width="7" Height="7" Fill="#34D399" VerticalAlignment="Center" Margin="0,0,8,0"/>
+          <TextBlock x:Name="StatusLabel"
+                     FontSize="13"
+                     Foreground="#ECEEED"
+                     FontFamily="Segoe UI"
+                     VerticalAlignment="Center"/>
+        </StackPanel>
+      </StackPanel>
+
+      <!-- ── Show/Hide cursor toggle ── -->
+      <TextBlock Text="CURSOR" Style="{StaticResource SectionLabel}"/>
+
+      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+        <CheckBox x:Name="CursorToggle"
+                  Foreground="#ADB5B2"
+                  FontSize="13"
+                  FontFamily="Segoe UI"
+                  VerticalAlignment="Center"
+                  Checked="OnCursorToggleChanged"
+                  Unchecked="OnCursorToggleChanged"
+                  Content="Show Clicky cursor"/>
+      </StackPanel>
+
+      <!-- ── Claude model ── -->
+      <TextBlock Text="AI MODEL" Style="{StaticResource SectionLabel}"/>
+
+      <ComboBox x:Name="ModelCombo"
+                Style="{StaticResource DarkCombo}"
+                SelectionChanged="OnModelChanged">
+        <ComboBoxItem Content="claude-sonnet-4-6"  Tag="claude-sonnet-4-6"/>
+        <ComboBoxItem Content="claude-opus-4-5"    Tag="claude-opus-4-5"/>
+        <ComboBoxItem Content="claude-haiku-3-5"   Tag="claude-haiku-3-5"/>
+      </ComboBox>
+
+      <!-- ── Worker URL ── -->
+      <TextBlock Text="WORKER URL" Style="{StaticResource SectionLabel}"/>
+
+      <Grid>
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <TextBox x:Name="WorkerUrlBox"
+                 Grid.Column="0"
+                 Style="{StaticResource DarkInput}"
+                 LostFocus="OnWorkerUrlLostFocus"
+                 KeyDown="OnWorkerUrlKeyDown"/>
+        <Button Grid.Column="1"
+                Content="Save"
+                Style="{StaticResource ActionButton}"
+                Background="#202221"
+                Foreground="#ADB5B2"
+                BorderBrush="#373B39"
+                BorderThickness="1"
+                Width="50"
+                Margin="6,0,0,0"
+                Click="OnSaveWorkerUrl"/>
+      </Grid>
+
+      <!-- ── Divider + footer ── -->
+      <Rectangle Height="1" Fill="#373B39" Margin="0,14,0,0"/>
+
+      <StackPanel Orientation="Horizontal" Margin="0,10,0,0" HorizontalAlignment="Center">
+        <Button Content="Watch Onboarding Again"
+                Style="{StaticResource GhostButton}"
+                Click="OnReplayOnboardingClick"/>
+        <TextBlock Text=" · " Foreground="#6B736F" FontFamily="Segoe UI" FontSize="12" VerticalAlignment="Center"/>
+        <Button Content="Quit"
+                Style="{StaticResource GhostButton}"
+                Click="OnQuitClick"/>
+      </StackPanel>
+
+    </StackPanel>
+  </Border>
+</Window>
