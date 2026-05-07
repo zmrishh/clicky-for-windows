@@ -7,6 +7,19 @@ using ClickyWindows.Core;
 
 namespace ClickyWindows.Api;
 
+// ── JSON ────────────────────────────────────────────────────────────────────
+
+internal static class AaiJsonOptions
+{
+    /// <summary>AssemblyAI Turn payloads may add fields; tolerate minor API drift.</summary>
+    public static readonly JsonSerializerOptions Relaxed = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        ReadCommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true
+    };
+}
+
 // ── DTOs ─────────────────────────────────────────────────────────────────────
 
 internal sealed class AaiMessageEnvelope
@@ -202,7 +215,9 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
     private async Task ReceiveLoopAsync(CancellationToken ct)
     {
         var buffer = new byte[8192];
-        var message = new StringBuilder();
+        // Multi-frame WebSocket text messages may split UTF-8 across fragments; decoding each
+        // fragment separately can corrupt characters and break JSON.parse → dead session.
+        await using var messageBytes = new IoMemoryStream();
 
         try
         {
@@ -211,14 +226,26 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
                 var result = await _ws.ReceiveAsync(buffer, ct).ConfigureAwait(false);
 
                 if (result.MessageType == WebSocketMessageType.Close) break;
-                if (result.MessageType == WebSocketMessageType.Binary) continue;
+                if (result.MessageType == WebSocketMessageType.Binary)
+                {
+                    messageBytes.SetLength(0);
+                    continue;
+                }
 
-                message.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
+                messageBytes.Write(buffer, 0, result.Count);
 
                 if (!result.EndOfMessage) continue;
 
-                HandleMessage(message.ToString());
-                message.Clear();
+                if (messageBytes.Length > 0)
+                {
+                    var payload = messageBytes.ToArray();
+                    messageBytes.SetLength(0);
+                    HandleMessage(Encoding.UTF8.GetString(payload));
+                }
+                else
+                {
+                    messageBytes.SetLength(0);
+                }
             }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -242,7 +269,8 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
                     break;
 
                 case "turn":
-                    var turn = JsonSerializer.Deserialize<AaiTurnMessage>(text)!;
+                    var turn = JsonSerializer.Deserialize<AaiTurnMessage>(text, AaiJsonOptions.Relaxed)
+                               ?? throw new JsonException("Turn message deserialization returned null.");
                     HandleTurnMessage(turn);
                     break;
 
@@ -256,7 +284,8 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
                     break;
 
                 case "error":
-                    var err = JsonSerializer.Deserialize<AaiErrorMessage>(text)!;
+                    var err = JsonSerializer.Deserialize<AaiErrorMessage>(text, AaiJsonOptions.Relaxed)
+                              ?? throw new JsonException("Error message deserialization returned null.");
                     var msg = err.Error ?? err.Message ?? "AssemblyAI returned an error.";
                     FailSession(new InvalidOperationException(msg));
                     break;

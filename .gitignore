@@ -5,6 +5,7 @@
 [Ll]ogs/
 publish/
 out/
+_build_verify/
 
 # Visual Studio / Rider / VS Code
 .vs/

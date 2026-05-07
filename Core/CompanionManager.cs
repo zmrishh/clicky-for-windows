@@ -89,6 +89,9 @@ public sealed class CompanionManager : IDisposable
     /// <summary>Avoids spamming the user if they mash Ctrl+Alt without mic permission.</summary>
     private DateTime _lastMicrophoneNeededHintUtc = DateTime.MinValue;
 
+    /// <summary>Throttles the "speech service stalled" toast when fallback closes a stuck session.</summary>
+    private DateTime _lastAssemblyAiStallHintUtc = DateTime.MinValue;
+
     private readonly AudioCaptureService _audioCapture;
     private readonly GlobalHotkeyMonitor _hotkeyMonitor;
     private readonly OverlayWindowManager _overlayManager;
@@ -215,6 +218,7 @@ public sealed class CompanionManager : IDisposable
     public void Stop()
     {
         _hotkeyMonitor.Stop();
+        AbortActiveResponseWorkflow();
         _permissionTimer?.Stop();
         StopRecordingSession();
         _overlayManager.HideOverlay();
@@ -233,6 +237,17 @@ public sealed class CompanionManager : IDisposable
         Settings.WorkerBaseUrl = url.Trim().TrimEnd('/');
         Settings.Save();
         RebindApiClients(nameof(SetWorkerBaseUrl));
+    }
+
+    /// <summary>Cancels and disposes the Claude/TTS pipeline token source so timeouts and interruptions don't leak.</summary>
+    private void AbortActiveResponseWorkflow()
+    {
+        if (_responseTaskCts == null) return;
+        try { _responseTaskCts.Cancel(); }
+        catch (ObjectDisposedException) { /* no-op */ }
+
+        _responseTaskCts = null;
+        // CTS is owned/disposed by the Task.Run lambda's finally once the pipeline exits.
     }
 
     public void SetClickyCursorEnabled(bool enabled)
@@ -361,8 +376,7 @@ public sealed class CompanionManager : IDisposable
         }
 
         // Cancel any in-flight response
-        _responseTaskCts?.Cancel();
-        _responseTaskCts = null;
+        AbortActiveResponseWorkflow();
         _ttsClient.StopPlayback();
         ClearDetectedElement();
         DetectedElementChanged?.Invoke();
@@ -417,6 +431,7 @@ public sealed class CompanionManager : IDisposable
                     _isPreparing = false;
                     _audioCapture.Start();
                     VoiceState = VoiceState.Listening;
+                    AppDebugLog.Write("AssemblyAI session ready → recording (listening).");
                 });
             }
             catch (Exception ex)
@@ -460,12 +475,19 @@ public sealed class CompanionManager : IDisposable
         _finalTranscriptFallbackTimer.Tick += (_, _) =>
         {
             _finalTranscriptFallbackTimer.Stop();
-            if (_isFinalizingTranscript)
-            {
-                _isFinalizingTranscript = false;
-                VoiceState = VoiceState.Idle;
-                ScheduleTransientHideIfNeeded();
-            }
+            if (!_isFinalizingTranscript) return;
+
+            AppDebugLog.Write(
+                $"AssemblyAI: fallback timer expired ({AppConstants.AssemblyAiFallbackDelaySeconds}s) before final transcript.");
+
+            try { _activeSession?.Cancel(); }
+            catch (Exception ex) { AppDebugLog.Write($"AssemblyAI Cancel after stall: {ex.Message}"); }
+            finally { _activeSession = null; }
+
+            _isFinalizingTranscript = false;
+            VoiceState = VoiceState.Idle;
+            ScheduleTransientHideIfNeeded();
+            WarnAssemblyAiStallThrottled();
         };
         _finalTranscriptFallbackTimer.Start();
     }
@@ -515,9 +537,25 @@ public sealed class CompanionManager : IDisposable
 
             LastTranscript = trimmed;
             Console.WriteLine($"🗣️ Transcript: {trimmed}");
-            AppDebugLog.Write($"Transcript: {trimmed}");
+            AppDebugLog.Write($"Final transcript ({trimmed.Length} chars): {trimmed}");
             SendTranscriptToClaudeWithScreenshot(trimmed);
         });
+    }
+
+    private void WarnAssemblyAiStallThrottled()
+    {
+        var now = DateTime.UtcNow;
+        if ((now - _lastAssemblyAiStallHintUtc).TotalSeconds < 25)
+            return;
+        _lastAssemblyAiStallHintUtc = now;
+
+        var logPath = IoPath.Combine(AppConstants.SettingsDirectory, "clicky-debug.log");
+        var msg =
+            "Clicky did not receive a finished transcript from the speech service.\r\n\r\n" +
+            "Try speaking a full sentence before releasing Ctrl+Alt, check your microphone volume, Worker URL,\r\n" +
+            $"and `%AppData%\\Clicky` settings.\r\n\r\nDetails: `{logPath}`";
+
+        ShowDiagnostic(msg, isError: false);
     }
 
     private void WarnMicrophoneNeededThrottled()
@@ -574,11 +612,14 @@ public sealed class CompanionManager : IDisposable
     /// </summary>
     private void SendTranscriptToClaudeWithScreenshot(string transcript)
     {
-        _responseTaskCts?.Cancel();
-        _responseTaskCts = new CancellationTokenSource();
-        var cts = _responseTaskCts;
+        AbortActiveResponseWorkflow();
+
+        var cts = new CancellationTokenSource();
+        cts.CancelAfter(TimeSpan.FromMinutes(5));
+        _responseTaskCts = cts;
 
         VoiceState = VoiceState.Processing;
+        AppDebugLog.Write($"Claude pipeline START — user transcript chars={transcript.Length}.");
 
         Task.Run(async () =>
         {
@@ -593,6 +634,8 @@ public sealed class CompanionManager : IDisposable
                     Data: c.ImageBytes,
                     Label: $"{c.Label} (image dimensions: {c.ScreenshotWidthPx}x{c.ScreenshotHeightPx} pixels)"
                 )).ToList();
+
+                AppDebugLog.Write($"Claude vision request — captures={captures.Count}.");
 
                 // 3. Build conversation history
                 var history = _history
@@ -616,6 +659,8 @@ public sealed class CompanionManager : IDisposable
                     AppDebugLog.Write($"Claude pipeline exception: {apiEx}");
                     throw;
                 }
+
+                AppDebugLog.Write($"Claude returned text chars={fullText.Trim().Length}.");
 
                 if (string.IsNullOrWhiteSpace(fullText))
                 {
@@ -653,6 +698,7 @@ public sealed class CompanionManager : IDisposable
                 // 8. TTS
                 if (!string.IsNullOrWhiteSpace(spokenText))
                 {
+                    AppDebugLog.Write($"TTS: speaking chars={spokenText.Trim().Length}.");
                     try
                     {
                         await _ttsClient.SpeakAsync(spokenText, cts.Token);
@@ -671,11 +717,29 @@ public sealed class CompanionManager : IDisposable
                             VoiceState = VoiceState.Responding);
                     }
                 }
+                else
+                {
+                    AppDebugLog.Write("TTS skipped — spoken text empty after POINT parse.");
+                }
+
+                WpfApp.Current.Dispatcher.Invoke(() =>
+                {
+                    if (!cts.IsCancellationRequested)
+                    {
+                        VoiceState = VoiceState.Idle;
+                        ScheduleTransientHideIfNeeded();
+                    }
+                });
+                AppDebugLog.Write("Claude pipeline END.");
             }
             catch (OperationCanceledException)
             {
-                Console.WriteLine("[Response] Cancelled");
-                return;
+                AppDebugLog.Write("[Response] Cancelled or timed out (Claude/TTS pipeline).");
+                WpfApp.Current.Dispatcher.Invoke(() =>
+                {
+                    VoiceState = VoiceState.Idle;
+                    ScheduleTransientHideIfNeeded();
+                });
             }
             catch (Exception ex)
             {
@@ -689,17 +753,15 @@ public sealed class CompanionManager : IDisposable
                         "If you just changed the Worker URL, save it again in the tray menu. ",
                         isError: true);
                 });
-                return;
             }
-
-            WpfApp.Current.Dispatcher.Invoke(() =>
+            finally
             {
-                if (!cts.IsCancellationRequested)
-                {
-                    VoiceState = VoiceState.Idle;
-                    ScheduleTransientHideIfNeeded();
-                }
-            });
+                if (ReferenceEquals(_responseTaskCts, cts))
+                    _responseTaskCts = null;
+
+                try { cts.Dispose(); }
+                catch (ObjectDisposedException) { /* no-op */ }
+            }
         }, cts.Token);
     }
 
