@@ -863,7 +863,15 @@ public sealed class CompanionManager : IDisposable
                 // 10. Execute initial actions then run the agentic continuation loop
                 if (actionResult.HasActions && !actionResult.IsDone)
                 {
-                    await RunAgentLoopAsync(transcript, actionResult, captures, cts.Token);
+                    try
+                    {
+                        await RunAgentLoopAsync(transcript, actionResult, captures, cts.Token);
+                    }
+                    catch (OperationCanceledException) { /* normal cancellation */ }
+                    catch (Exception agentEx)
+                    {
+                        AppDebugLog.Write($"Agent loop CRASHED: {agentEx.GetType().Name}: {agentEx.Message}\n{agentEx.StackTrace}");
+                    }
                 }
 
                 await ttsTask;
@@ -1009,7 +1017,16 @@ public sealed class CompanionManager : IDisposable
             }
 
             // Execute this batch of actions; captures are refreshed between each step
-            captures = await ExecuteActionsAsync(current.Actions, captures, ct);
+            try
+            {
+                captures = await ExecuteActionsAsync(current.Actions, captures, ct);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception stepEx)
+            {
+                AppDebugLog.Write($"Agent loop: ExecuteActionsAsync threw {stepEx.GetType().Name}: {stepEx.Message}");
+                break;
+            }
             iteration++;
 
             // Record what was done for the continuation context
@@ -1142,7 +1159,15 @@ public sealed class CompanionManager : IDisposable
             await tcs.Task.WaitAsync(ct);
             ct.ThrowIfCancellationRequested();
 
-            ExecuteStep(action, captures);
+            try
+            {
+                ExecuteStep(action, captures);
+            }
+            catch (Exception stepEx)
+            {
+                AppDebugLog.Write($"ExecuteStep failed ({action.GetType().Name}): {stepEx.GetType().Name}: {stepEx.Message}");
+                // Don't abort the whole loop for a single step failure — log and continue
+            }
 
             bool moreActionsAhead = actions.Skip(i + 1).Any(a => a is not ActionTag.Wait);
             if (moreActionsAhead)

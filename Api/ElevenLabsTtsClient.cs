@@ -28,6 +28,10 @@ public sealed class ElevenLabsTtsClient : IDisposable
     private SpeechSynthesizer?  _winSynth;
     private readonly object     _synthLock = new();
 
+    // Circuit breaker: if ElevenLabs fails with an auth/quota error, stop
+    // trying for the rest of this session rather than wasting time on every call.
+    private volatile bool _elevenLabsDead;
+
     public ElevenLabsTtsClient(string workerBaseUrl)
     {
         _proxyUri = new Uri(workerBaseUrl.TrimEnd('/') + "/tts");
@@ -38,19 +42,33 @@ public sealed class ElevenLabsTtsClient : IDisposable
 
     public async Task SpeakAsync(string text, CancellationToken cancellationToken = default)
     {
-        // Try ElevenLabs first; fall through to Windows TTS on any failure
-        try
+        // Try ElevenLabs first; fall through to Windows TTS on any failure.
+        // Circuit breaker: if ElevenLabs has already returned an auth/quota error
+        // this session, skip the HTTP call entirely to avoid ~350ms wasted latency.
+        if (!_elevenLabsDead)
         {
-            await SpeakElevenLabsAsync(text, cancellationToken).ConfigureAwait(false);
-            return;
-        }
-        catch (OperationCanceledException)
-        {
-            throw; // don't swallow cancellation
-        }
-        catch (Exception ex)
-        {
-            AppDebugLog.Write($"TTS: ElevenLabs failed ({ex.Message}) — using Windows TTS.");
+            try
+            {
+                await SpeakElevenLabsAsync(text, cancellationToken).ConfigureAwait(false);
+                return;
+            }
+            catch (OperationCanceledException)
+            {
+                throw; // don't swallow cancellation
+            }
+            catch (HttpRequestException ex) when (
+                ex.StatusCode is System.Net.HttpStatusCode.Unauthorized or
+                                 System.Net.HttpStatusCode.Forbidden or
+                                 System.Net.HttpStatusCode.PaymentRequired)
+            {
+                // Permanent auth/quota failure — skip ElevenLabs for the rest of this session
+                _elevenLabsDead = true;
+                AppDebugLog.Write($"TTS: ElevenLabs permanently disabled this session ({(int?)ex.StatusCode}) — using Windows TTS exclusively.");
+            }
+            catch (Exception ex)
+            {
+                AppDebugLog.Write($"TTS: ElevenLabs failed ({ex.Message}) — using Windows TTS.");
+            }
         }
 
         await SpeakWindowsAsync(text, cancellationToken).ConfigureAwait(false);
@@ -63,12 +81,16 @@ public sealed class ElevenLabsTtsClient : IDisposable
 
     public void StopPlayback()
     {
+        // Null _waveOut first so the PlaybackStopped handler knows not to re-null it,
+        // then call Stop() — which fires PlaybackStopped on a thread-pool thread.
+        // Dispose is handled exclusively inside PlaybackStopped to avoid double-dispose.
+        WaveOutEvent? wo;
         lock (_playbackLock)
         {
-            _waveOut?.Stop();
-            _waveOut?.Dispose();
+            wo = _waveOut;
             _waveOut = null;
         }
+        try { wo?.Stop(); } catch { /* best-effort */ }
     }
 
     // ── ElevenLabs path ───────────────────────────────────────────────────────
@@ -171,13 +193,18 @@ public sealed class ElevenLabsTtsClient : IDisposable
 
         waveOut.PlaybackStopped += (_, _) =>
         {
-            onStopped();
-            waveOut.Dispose();
+            // Dispose the audio data regardless of how playback ended
+            try { onStopped(); } catch { /* best-effort */ }
+
+            // Only null _waveOut if this instance is still current (StopPlayback
+            // may have already swapped it out).  Always dispose the WaveOutEvent
+            // exactly once — right here — so StopPlayback must NOT call Dispose.
             lock (_playbackLock)
             {
                 if (ReferenceEquals(_waveOut, waveOut))
                     _waveOut = null;
             }
+            try { waveOut.Dispose(); } catch { /* best-effort */ }
         };
 
         waveOut.Init(provider);
