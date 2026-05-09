@@ -37,7 +37,8 @@
     <Border x:Name="NavBubble"
             Background="#3380FF"
             CornerRadius="6"
-            Padding="8,4"
+            Padding="8,6"
+            MaxWidth="420"
             Visibility="Collapsed"
             Opacity="0"
             Canvas.Left="0" Canvas.Top="0">
@@ -50,9 +51,11 @@
       </Border.RenderTransform>
       <TextBlock x:Name="NavBubbleText"
                  Foreground="White"
-                 FontSize="11"
+                 FontSize="12"
                  FontWeight="Medium"
-                 FontFamily="Segoe UI"/>
+                 FontFamily="Segoe UI"
+                 TextWrapping="Wrap"
+                 LineHeight="18"/>
     </Border>
 
     <!-- Blue triangle cursor (idle + responding) -->

@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace ClickyWindows.Core;
 
@@ -23,8 +24,10 @@ public static class ActionExecutor
     [DllImport("user32.dll")]
     private static extern int GetSystemMetrics(int nIndex);
 
-    private const int SM_CXVIRTUALSCREEN = 78;
-    private const int SM_CYVIRTUALSCREEN = 79;
+    private const int SM_CXVIRTUALSCREEN  = 78;
+    private const int SM_CYVIRTUALSCREEN  = 79;
+    private const int SM_XVIRTUALSCREEN   = 76;
+    private const int SM_YVIRTUALSCREEN   = 77;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct INPUT
@@ -79,43 +82,54 @@ public static class ActionExecutor
 
     /// <summary>
     /// Left-clicks at the given physical screen pixel coordinates.
-    /// Moves the cursor smoothly to the position first so the click feels natural.
+    /// Normalises to the full virtual desktop space so multi-monitor offsets work correctly.
     /// </summary>
     public static void Click(int physX, int physY, bool rightClick = false)
     {
-        // Normalise to 0–65535 across the full virtual desktop
+        // Virtual desktop origin can be negative on multi-monitor setups
+        int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
         int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
         int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        int nx = (int)((physX * 65535.0) / vw);
-        int ny = (int)((physY * 65535.0) / vh);
+
+        // Normalise the physical coordinate (which is already in absolute screen space)
+        // relative to the virtual desktop origin, then scale to 0–65535
+        int nx = (int)(((physX - vx) * 65535.0) / vw);
+        int ny = (int)(((physY - vy) * 65535.0) / vh);
 
         uint downFlag = rightClick ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_LEFTDOWN;
         uint upFlag   = rightClick ? MOUSEEVENTF_RIGHTUP   : MOUSEEVENTF_LEFTUP;
 
-        var inputs = new INPUT[]
+        // Move first, then separate down/up so the OS sees a well-formed click sequence
+        var moveInput = new INPUT[]
         {
-            // Move to target
             new() { type = INPUT_MOUSE, u = new INPUTUNION { mi = new MOUSEINPUT
             {
                 dx = nx, dy = ny,
                 dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
-            }}},
-            // Button down
+            }}}
+        };
+        SendInput(1, moveInput, Marshal.SizeOf<INPUT>());
+
+        // Brief pause so the target window can receive focus after cursor moves
+        Thread.Sleep(30);
+
+        var clickInputs = new INPUT[]
+        {
             new() { type = INPUT_MOUSE, u = new INPUTUNION { mi = new MOUSEINPUT
             {
                 dx = nx, dy = ny,
                 dwFlags = downFlag | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
             }}},
-            // Button up
             new() { type = INPUT_MOUSE, u = new INPUTUNION { mi = new MOUSEINPUT
             {
                 dx = nx, dy = ny,
                 dwFlags = upFlag | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
             }}}
         };
+        SendInput(2, clickInputs, Marshal.SizeOf<INPUT>());
 
-        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<INPUT>());
-        AppDebugLog.Write($"ActionExecutor: click ({physX},{physY}) right={rightClick}");
+        AppDebugLog.Write($"ActionExecutor: click physXY=({physX},{physY}) norm=({nx},{ny}) right={rightClick}");
     }
 
     /// <summary>

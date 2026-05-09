@@ -832,15 +832,20 @@ public sealed class CompanionManager : IDisposable
                 var parseResult  = PointingParseResult.Parse(fullText);
                 var actionResult = ActionTagParser.Parse(parseResult.SpokenText);
 
-                // Use action-stripped text as the spoken/displayed text
-                var spokenText = actionResult.SpokenText;
+                // Guarantee spokenText is never empty — Claude sometimes returns only a tag
+                var spokenText = string.IsNullOrWhiteSpace(actionResult.SpokenText)
+                    ? actionResult.Action switch
+                    {
+                        ActionTag.Click c  => c.RightClick ? "right-clicking." : "clicking.",
+                        ActionTag.Type  _  => "typing that for you.",
+                        ActionTag.Open  o  => $"opening {o.AppName}.",
+                        _                  => "done."
+                    }
+                    : actionResult.SpokenText;
 
-                // 6. Show response panel with the full spoken text
-                if (!string.IsNullOrWhiteSpace(spokenText))
-                {
-                    WpfApp.Current.Dispatcher.Invoke(() =>
-                        _overlayManager.ShowResponse(spokenText));
-                }
+                // 6. Show response in the blue NavBubble
+                WpfApp.Current.Dispatcher.Invoke(() =>
+                    _overlayManager.ShowResponse(spokenText));
 
                 // 7. Coordinate translation — switch to UI thread for state mutation
                 await WpfApp.Current.Dispatcher.InvokeAsync(() =>
@@ -867,31 +872,24 @@ public sealed class CompanionManager : IDisposable
                     await ExecuteActionWithToastAsync(actionResult.Action, captures, cts.Token);
                 }
 
-                // 10. TTS
-                if (!string.IsNullOrWhiteSpace(spokenText))
+                // 10. TTS — spokenText is always non-empty at this point
+                AppDebugLog.Write($"TTS: speaking chars={spokenText.Trim().Length}.");
+                try
                 {
-                    AppDebugLog.Write($"TTS: speaking chars={spokenText.Trim().Length}.");
-                    try
+                    await _ttsClient.SpeakAsync(spokenText, cts.Token);
+                    WpfApp.Current.Dispatcher.Invoke(() =>
                     {
-                        await _ttsClient.SpeakAsync(spokenText, cts.Token);
-                        WpfApp.Current.Dispatcher.Invoke(() =>
-                        {
-                            if (!cts.IsCancellationRequested)
-                                VoiceState = VoiceState.Responding;
-                        });
-                    }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        Console.WriteLine($"⚠️ TTS error: {ex.Message}");
-                        ElevenLabsTtsClient.SpeakFallback(
-                            "I'm all out of credits. Please tell whoever set this up to top them up.");
-                        WpfApp.Current.Dispatcher.Invoke(() =>
-                            VoiceState = VoiceState.Responding);
-                    }
+                        if (!cts.IsCancellationRequested)
+                            VoiceState = VoiceState.Responding;
+                    });
                 }
-                else
+                catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    AppDebugLog.Write("TTS skipped — spoken text empty after tag parse.");
+                    Console.WriteLine($"⚠️ TTS error: {ex.Message}");
+                    ElevenLabsTtsClient.SpeakFallback(
+                        "I'm all out of credits. Please tell whoever set this up to top them up.");
+                    WpfApp.Current.Dispatcher.Invoke(() =>
+                        VoiceState = VoiceState.Responding);
                 }
 
                 WpfApp.Current.Dispatcher.Invoke(() =>
@@ -1310,6 +1308,8 @@ public sealed class CompanionManager : IDisposable
         - [CLICK:x,y:right] — right-click at x,y
         - [TYPE:the text to type] — type text into the currently focused window
         - [OPEN:app name] — launch an application by name (e.g. notepad, calculator, chrome)
+
+        CRITICAL: always write spoken text first. the action tag is always at the very end — never start your response with a tag. for example: "sure, clicking that for you. [CLICK:342,180]" — not "[CLICK:342,180]". if you omit the spoken text, nothing will be spoken aloud and the user gets no feedback.
 
         use screenshot pixel coordinates for CLICK, the same coordinate space as POINT. you can combine a POINT tag with an action tag on the same response if it helps the user see what you're about to do. put the action tag first, then the POINT tag at the very end.
         """;

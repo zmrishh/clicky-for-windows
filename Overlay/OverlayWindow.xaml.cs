@@ -530,7 +530,7 @@ public sealed partial class OverlayWindow : Window
     // ── Response panel ────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Shows the floating response panel with Claude's full reply.
+    /// Shows Claude's full reply in the existing blue NavBubble next to the cursor.
     /// Auto-dismisses after 8 seconds. Safe to call from any thread.
     /// </summary>
     public void ShowResponse(string text)
@@ -539,21 +539,27 @@ public sealed partial class OverlayWindow : Window
         {
             _responseDismissTimer?.Stop();
 
-            ResponseText.Text = text;
-            ResponsePanel.Visibility = Visibility.Visible;
+            // If a pointing flight is in progress, let it finish — don't hijack it.
+            if (_navMode != BuddyNavigationMode.FollowingCursor) return;
 
-            // Measure to get actual width for clamped positioning
-            ResponsePanel.Measure(new WpfSize(double.PositiveInfinity, double.PositiveInfinity));
-            PositionResponsePanel();
+            NavBubbleText.Text = text;
+            NavBubble.Visibility = Visibility.Visible;
+            NavBubble.Opacity = 1.0;
+            NavBubbleScale.ScaleX = 0.85;
+            NavBubbleScale.ScaleY = 0.85;
+            NavBubbleScale.CenterX = 0;
+            NavBubbleScale.CenterY = 0;
 
-            // Slide up from 10px below
-            ResponsePanelTranslate.Y = 10;
-            var slideAnim = new DoubleAnimation(10, 0, new Duration(TimeSpan.FromSeconds(0.25)))
+            var scaleAnim = new DoubleAnimation(0.85, 1.0, new Duration(TimeSpan.FromSeconds(0.25)))
             {
                 EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
             };
-            ResponsePanelTranslate.BeginAnimation(TranslateTransform.YProperty, slideAnim);
-            FadeTo(ResponsePanel, 1.0, TimeSpan.FromSeconds(0.25));
+            NavBubbleScale.BeginAnimation(ScaleTransform.ScaleXProperty, scaleAnim);
+            NavBubbleScale.BeginAnimation(ScaleTransform.ScaleYProperty, scaleAnim);
+
+            // Position immediately based on current cursor
+            System.Windows.Controls.Canvas.SetLeft(NavBubble, _cursorPos.X + 10);
+            System.Windows.Controls.Canvas.SetTop(NavBubble,  _cursorPos.Y + 18);
 
             _responseDismissTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(8) };
             _responseDismissTimer.Tick += (_, _) => HideResponse();
@@ -561,36 +567,24 @@ public sealed partial class OverlayWindow : Window
         });
     }
 
-    /// <summary>Hides the response panel immediately with a fade.</summary>
+    /// <summary>Hides the response shown in the NavBubble immediately with a fade.</summary>
     public void HideResponse()
     {
         _responseDismissTimer?.Stop();
         _responseDismissTimer = null;
 
-        FadeTo(ResponsePanel, 0.0, TimeSpan.FromSeconds(0.2));
+        if (_navMode != BuddyNavigationMode.FollowingCursor) return;
+
+        FadeTo(NavBubble, 0.0, TimeSpan.FromSeconds(0.2));
         Dispatcher.InvokeAsync(async () =>
         {
             await Task.Delay(220);
-            ResponsePanel.Visibility = Visibility.Collapsed;
-            ResponseText.Text = "";
+            if (_navMode == BuddyNavigationMode.FollowingCursor)
+            {
+                NavBubble.Visibility = Visibility.Collapsed;
+                NavBubbleText.Text = "";
+            }
         });
-    }
-
-    private void PositionResponsePanel()
-    {
-        // Place 40px below cursor, clamped to screen edges with 12px margin
-        double panelW = ResponsePanel.DesiredSize.Width > 0
-            ? ResponsePanel.DesiredSize.Width
-            : ResponsePanel.MaxWidth;
-        double panelH = ResponsePanel.DesiredSize.Height > 0
-            ? ResponsePanel.DesiredSize.Height
-            : 120;
-
-        double x = Math.Clamp(_cursorPos.X - panelW / 2, 12, Width  - panelW - 12);
-        double y = Math.Clamp(_cursorPos.Y + 40,          12, Height - panelH - 12);
-
-        System.Windows.Controls.Canvas.SetLeft(ResponsePanel, x);
-        System.Windows.Controls.Canvas.SetTop(ResponsePanel,  y);
     }
 
     // ── Action toast ──────────────────────────────────────────────────────────
