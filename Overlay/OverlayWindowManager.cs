@@ -111,6 +111,41 @@ public sealed class OverlayWindowManager
 
     public bool IsShowingOverlay => _windows.Count > 0;
 
+    /// <summary>
+    /// Shows the response panel on the overlay covering the cursor's current screen.
+    /// Must be called from the UI thread.
+    /// </summary>
+    public void ShowResponse(string text)
+    {
+        var cp = System.Windows.Forms.Cursor.Position;
+        var target = _windows.FirstOrDefault(w =>
+            w.PhysicalBounds.Contains(cp.X, cp.Y)) ?? _windows.FirstOrDefault();
+        target?.ShowResponse(text);
+    }
+
+    /// <summary>Hides the response panel on all overlays.</summary>
+    public void HideResponse()
+    {
+        foreach (var w in _windows)
+            w.HideResponse();
+    }
+
+    /// <summary>
+    /// Shows the action countdown toast on the cursor's screen overlay and fires
+    /// <paramref name="onComplete"/> after <paramref name="holdMs"/> milliseconds.
+    /// </summary>
+    public void ShowActionToast(string message, int holdMs, Action onComplete)
+    {
+        var cp = System.Windows.Forms.Cursor.Position;
+        var target = _windows.FirstOrDefault(w =>
+            w.PhysicalBounds.Contains(cp.X, cp.Y)) ?? _windows.FirstOrDefault();
+
+        if (target != null)
+            target.ShowActionToast(message, holdMs, onComplete);
+        else
+            onComplete(); // no overlay visible — execute immediately
+    }
+
     // ── DPI helper ────────────────────────────────────────────────────────────
 
     [DllImport("user32.dll")]

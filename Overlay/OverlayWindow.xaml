@@ -117,6 +117,59 @@
       </Path>
     </Canvas>
 
+    <!-- Floating response panel — shows Claude's full reply as readable text -->
+    <Border x:Name="ResponsePanel"
+            MaxWidth="480"
+            CornerRadius="12"
+            Padding="14,10"
+            Visibility="Collapsed"
+            Opacity="0"
+            Canvas.Left="0" Canvas.Top="0">
+      <Border.Background>
+        <SolidColorBrush Color="#111511" Opacity="0.88"/>
+      </Border.Background>
+      <Border.Effect>
+        <DropShadowEffect Color="Black" BlurRadius="18" ShadowDepth="4" Opacity="0.45"/>
+      </Border.Effect>
+      <Border.RenderTransform>
+        <TranslateTransform x:Name="ResponsePanelTranslate"/>
+      </Border.RenderTransform>
+      <ScrollViewer x:Name="ResponseScroll"
+                    MaxHeight="260"
+                    VerticalScrollBarVisibility="Auto"
+                    HorizontalScrollBarVisibility="Disabled">
+        <TextBlock x:Name="ResponseText"
+                   Foreground="#F0F0F0"
+                   FontSize="14"
+                   FontFamily="Segoe UI"
+                   TextWrapping="Wrap"
+                   LineHeight="20"/>
+      </ScrollViewer>
+    </Border>
+
+    <!-- Action countdown toast — appears before executing a click/type/open -->
+    <Border x:Name="ActionToast"
+            CornerRadius="8"
+            Padding="12,7"
+            Visibility="Collapsed"
+            Opacity="0"
+            Canvas.Left="0" Canvas.Top="0">
+      <Border.Background>
+        <SolidColorBrush Color="#1A1A1A" Opacity="0.92"/>
+      </Border.Background>
+      <Border.Effect>
+        <DropShadowEffect Color="Black" BlurRadius="12" ShadowDepth="3" Opacity="0.5"/>
+      </Border.Effect>
+      <Border.RenderTransform>
+        <TranslateTransform x:Name="ActionToastTranslate"/>
+      </Border.RenderTransform>
+      <TextBlock x:Name="ActionToastText"
+                 Foreground="#FFD060"
+                 FontSize="12"
+                 FontFamily="Segoe UI"
+                 FontWeight="Medium"/>
+    </Border>
+
     <!-- Onboarding video (MediaElement — HLS playback via Media Foundation) -->
     <Border x:Name="VideoContainer"
             Width="330" Height="186"

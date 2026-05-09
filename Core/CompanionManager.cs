@@ -371,6 +371,7 @@ public sealed class CompanionManager : IDisposable
         _ttsClient.StopPlayback();
         ClearDetectedElement();
         DetectedElementChanged?.Invoke();
+        _overlayManager.HideResponse();
 
         // Dismiss onboarding prompt if visible
         if (ShowOnboardingPrompt)
@@ -827,17 +828,29 @@ public sealed class CompanionManager : IDisposable
 
                 cts.Token.ThrowIfCancellationRequested();
 
-                // 5. Parse [POINT:...] tag
-                var parseResult = PointingParseResult.Parse(fullText);
-                var spokenText = parseResult.SpokenText;
+                // 5. Parse [POINT:...] tag and [ACTION:...] tags
+                var parseResult  = PointingParseResult.Parse(fullText);
+                var actionResult = ActionTagParser.Parse(parseResult.SpokenText);
 
-                // 6. Coordinate translation — switch to UI thread for state mutation
+                // Use action-stripped text as the spoken/displayed text
+                var spokenText = actionResult.SpokenText;
+
+                // 6. Show response panel with the full spoken text
+                if (!string.IsNullOrWhiteSpace(spokenText))
+                {
+                    WpfApp.Current.Dispatcher.Invoke(() =>
+                        _overlayManager.ShowResponse(spokenText));
+                }
+
+                // 7. Coordinate translation — switch to UI thread for state mutation
                 await WpfApp.Current.Dispatcher.InvokeAsync(() =>
                 {
-                    HandlePointingTag(parseResult, captures);
+                    // Re-parse pointing from the action-stripped text so both can coexist
+                    var pointResult = PointingParseResult.Parse(fullText);
+                    HandlePointingTag(pointResult, captures);
                 });
 
-                // 7. Update conversation history
+                // 8. Update conversation history
                 WpfApp.Current.Dispatcher.Invoke(() =>
                 {
                     _history.Add((transcript, spokenText));
@@ -848,7 +861,13 @@ public sealed class CompanionManager : IDisposable
 
                 cts.Token.ThrowIfCancellationRequested();
 
-                // 8. TTS
+                // 9. Execute action (with countdown toast) if Claude requested one
+                if (actionResult.Action != null)
+                {
+                    await ExecuteActionWithToastAsync(actionResult.Action, captures, cts.Token);
+                }
+
+                // 10. TTS
                 if (!string.IsNullOrWhiteSpace(spokenText))
                 {
                     AppDebugLog.Write($"TTS: speaking chars={spokenText.Trim().Length}.");
@@ -872,7 +891,7 @@ public sealed class CompanionManager : IDisposable
                 }
                 else
                 {
-                    AppDebugLog.Write("TTS skipped — spoken text empty after POINT parse.");
+                    AppDebugLog.Write("TTS skipped — spoken text empty after tag parse.");
                 }
 
                 WpfApp.Current.Dispatcher.Invoke(() =>
@@ -974,6 +993,61 @@ public sealed class CompanionManager : IDisposable
         // Switch to idle so the triangle becomes visible before the flight animation
         VoiceState = VoiceState.Idle;
         DetectedElementChanged?.Invoke();
+    }
+
+    // ── Action execution ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Shows a 1.5-second countdown toast on the overlay then executes the action.
+    /// Translates Claude's screenshot-pixel coordinates to physical screen pixels
+    /// using the same scaling logic as HandlePointingTag.
+    /// </summary>
+    private async Task ExecuteActionWithToastAsync(
+        ActionTag action,
+        List<ScreenCaptureData> captures,
+        CancellationToken ct)
+    {
+        string toastMessage = action switch
+        {
+            ActionTag.Click c  => c.RightClick ? "right-clicking..." : "clicking...",
+            ActionTag.Type  t  => $"typing: {t.Text.Truncate(30)}",
+            ActionTag.Open  o  => $"opening {o.AppName}...",
+            _                  => "executing..."
+        };
+
+        AppDebugLog.Write($"Action: {toastMessage}");
+
+        // Show toast for 1500ms then execute
+        var tcs = new TaskCompletionSource<bool>();
+        WpfApp.Current.Dispatcher.Invoke(() =>
+            _overlayManager.ShowActionToast(toastMessage, 1500, () => tcs.TrySetResult(true)));
+
+        await tcs.Task.WaitAsync(ct);
+        ct.ThrowIfCancellationRequested();
+
+        switch (action)
+        {
+            case ActionTag.Click click:
+                var clickTarget = captures.FirstOrDefault(c => c.IsCursorScreen)
+                                  ?? captures.FirstOrDefault();
+                if (clickTarget != null)
+                {
+                    double scaleX = clickTarget.PhysicalBounds.Width  / (double)clickTarget.ScreenshotWidthPx;
+                    double scaleY = clickTarget.PhysicalBounds.Height / (double)clickTarget.ScreenshotHeightPx;
+                    int physX = clickTarget.PhysicalBounds.X + (int)(click.X * scaleX);
+                    int physY = clickTarget.PhysicalBounds.Y + (int)(click.Y * scaleY);
+                    ActionExecutor.Click(physX, physY, click.RightClick);
+                }
+                break;
+
+            case ActionTag.Type type:
+                ActionExecutor.Type(type.Text);
+                break;
+
+            case ActionTag.Open open:
+                ActionExecutor.OpenApp(open.AppName);
+                break;
+        }
     }
 
     // ── Transient hide ────────────────────────────────────────────────────────
@@ -1227,7 +1301,19 @@ public sealed class CompanionManager : IDisposable
         format: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space, and label is a short 1-3 word description of the element (like "search bar" or "save button"). if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
 
         if pointing wouldn't help, append [POINT:none].
+
+        performing actions:
+        you can also do things on screen — click buttons, type text, or open applications. only use actions when the user explicitly asks you to do something (e.g. "click that", "open notepad", "type hello"). never act without being asked.
+
+        to perform an action, append ONE action tag after your spoken text (before or instead of a POINT tag):
+        - [CLICK:x,y] — left-click at screenshot pixel coordinates x,y on the cursor's screen
+        - [CLICK:x,y:right] — right-click at x,y
+        - [TYPE:the text to type] — type text into the currently focused window
+        - [OPEN:app name] — launch an application by name (e.g. notepad, calculator, chrome)
+
+        use screenshot pixel coordinates for CLICK, the same coordinate space as POINT. you can combine a POINT tag with an action tag on the same response if it helps the user see what you're about to do. put the action tag first, then the POINT tag at the very end.
         """;
+
 
     private const string OnboardingDemoSystemPrompt = """
         you're clicky, a small blue cursor buddy living on the user's screen. you're showing off during onboarding — look at their screen and find ONE specific, concrete thing to point at. pick something with a clear name or identity: a specific app icon (say its name), a specific word or phrase of text you can read, a specific filename, a specific button label, a specific tab title, a specific image you can describe. do NOT point at vague things like "a window" or "some text" — be specific about exactly what you see.

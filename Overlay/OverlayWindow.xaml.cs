@@ -73,6 +73,12 @@ public sealed partial class OverlayWindow : Window
     private double _welcomeBubbleWidth;
     private double _navBubbleWidth;
 
+    // Response panel auto-dismiss timer
+    private DispatcherTimer? _responseDismissTimer;
+
+    // Action toast timer
+    private DispatcherTimer? _actionToastTimer;
+
     // Waveform profile
     private static readonly double[] WaveBarProfile = [0.4, 0.7, 1.0, 0.7, 0.4];
     private readonly System.Windows.Shapes.Rectangle[] _waveBars;
@@ -161,6 +167,8 @@ public sealed partial class OverlayWindow : Window
         _flightTimer?.Stop();
         _waveTimer?.Stop();
         _charStreamTimer?.Stop();
+        _responseDismissTimer?.Stop();
+        _actionToastTimer?.Stop();
         _spinnerStoryboard?.Stop();
         StopOnboardingVideo();
     }
@@ -517,6 +525,115 @@ public sealed partial class OverlayWindow : Window
         NavBubble.Visibility = Visibility.Collapsed;
         NavBubbleText.Text = "";
         _manager.ClearDetectedElement();
+    }
+
+    // ── Response panel ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Shows the floating response panel with Claude's full reply.
+    /// Auto-dismisses after 8 seconds. Safe to call from any thread.
+    /// </summary>
+    public void ShowResponse(string text)
+    {
+        Dispatcher.InvokeAsync(() =>
+        {
+            _responseDismissTimer?.Stop();
+
+            ResponseText.Text = text;
+            ResponsePanel.Visibility = Visibility.Visible;
+
+            // Measure to get actual width for clamped positioning
+            ResponsePanel.Measure(new WpfSize(double.PositiveInfinity, double.PositiveInfinity));
+            PositionResponsePanel();
+
+            // Slide up from 10px below
+            ResponsePanelTranslate.Y = 10;
+            var slideAnim = new DoubleAnimation(10, 0, new Duration(TimeSpan.FromSeconds(0.25)))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            };
+            ResponsePanelTranslate.BeginAnimation(TranslateTransform.YProperty, slideAnim);
+            FadeTo(ResponsePanel, 1.0, TimeSpan.FromSeconds(0.25));
+
+            _responseDismissTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(8) };
+            _responseDismissTimer.Tick += (_, _) => HideResponse();
+            _responseDismissTimer.Start();
+        });
+    }
+
+    /// <summary>Hides the response panel immediately with a fade.</summary>
+    public void HideResponse()
+    {
+        _responseDismissTimer?.Stop();
+        _responseDismissTimer = null;
+
+        FadeTo(ResponsePanel, 0.0, TimeSpan.FromSeconds(0.2));
+        Dispatcher.InvokeAsync(async () =>
+        {
+            await Task.Delay(220);
+            ResponsePanel.Visibility = Visibility.Collapsed;
+            ResponseText.Text = "";
+        });
+    }
+
+    private void PositionResponsePanel()
+    {
+        // Place 40px below cursor, clamped to screen edges with 12px margin
+        double panelW = ResponsePanel.DesiredSize.Width > 0
+            ? ResponsePanel.DesiredSize.Width
+            : ResponsePanel.MaxWidth;
+        double panelH = ResponsePanel.DesiredSize.Height > 0
+            ? ResponsePanel.DesiredSize.Height
+            : 120;
+
+        double x = Math.Clamp(_cursorPos.X - panelW / 2, 12, Width  - panelW - 12);
+        double y = Math.Clamp(_cursorPos.Y + 40,          12, Height - panelH - 12);
+
+        System.Windows.Controls.Canvas.SetLeft(ResponsePanel, x);
+        System.Windows.Controls.Canvas.SetTop(ResponsePanel,  y);
+    }
+
+    // ── Action toast ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Shows a brief countdown toast (e.g. "clicking in 1…") before an action executes.
+    /// Calls <paramref name="onComplete"/> after <paramref name="holdMs"/> ms.
+    /// </summary>
+    public void ShowActionToast(string message, int holdMs, Action onComplete)
+    {
+        Dispatcher.InvokeAsync(() =>
+        {
+            _actionToastTimer?.Stop();
+
+            ActionToastText.Text = message;
+            ActionToast.Visibility = Visibility.Visible;
+
+            ActionToast.Measure(new WpfSize(double.PositiveInfinity, double.PositiveInfinity));
+            double toastW = ActionToast.DesiredSize.Width > 0 ? ActionToast.DesiredSize.Width : 140;
+            double toastH = ActionToast.DesiredSize.Height > 0 ? ActionToast.DesiredSize.Height : 32;
+            double tx = Math.Clamp(_cursorPos.X - toastW / 2, 12, Width  - toastW - 12);
+            double ty = Math.Clamp(_cursorPos.Y - toastH - 18, 12, Height - toastH - 12);
+            System.Windows.Controls.Canvas.SetLeft(ActionToast, tx);
+            System.Windows.Controls.Canvas.SetTop(ActionToast,  ty);
+
+            FadeTo(ActionToast, 1.0, TimeSpan.FromSeconds(0.15));
+
+            _actionToastTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(holdMs) };
+            _actionToastTimer.Tick += (_, _) =>
+            {
+                _actionToastTimer.Stop();
+                _actionToastTimer = null;
+                FadeTo(ActionToast, 0.0, TimeSpan.FromSeconds(0.2));
+                Dispatcher.InvokeAsync(async () =>
+                {
+                    await Task.Delay(220);
+                    ActionToast.Visibility = Visibility.Collapsed;
+                    ActionToastText.Text = "";
+                });
+                onComplete();
+            };
+            _actionToastTimer.Start();
+        });
     }
 
     // ── Text streaming ────────────────────────────────────────────────────────
