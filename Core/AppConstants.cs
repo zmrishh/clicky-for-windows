@@ -33,7 +33,7 @@ internal static class AppConstants
     /// <summary>After ForceEndpoint, wait this long before delivering best-effort transcript if no end_turn.</summary>
     public const double AssemblyAiExplicitFinalGracePeriodSeconds = 2.2;
     /// <summary>If the streaming session never calls OnFinalTranscriptReady this long after key-up, abandon it.</summary>
-    public const double AssemblyAiFallbackDelaySeconds = 8.0;
+    public const double AssemblyAiFallbackDelaySeconds = 4.0;
 
     // Overlay
     public const double CursorOffsetX = 35.0;

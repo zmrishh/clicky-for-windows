@@ -82,6 +82,8 @@ public sealed class AssemblyAIStreamingProvider
         CancellationToken cancellationToken = default)
     {
         var token = await FetchTemporaryTokenAsync(cancellationToken).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+
         Console.WriteLine($"[AssemblyAI] Got token: {token[..Math.Min(20, token.Length)]}...");
 
         var session = new AssemblyAISession(
@@ -164,52 +166,62 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
 
     internal async Task OpenAsync(CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
+
         var url = BuildWebSocketUrl();
         _ws = new ClientWebSocket();
         _readyTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        AppDebugLog.Write($"AssemblyAI: connecting WebSocket to {url.Host}…");
-
-        // ConnectAsync has been observed to hang indefinitely on some networks if the TLS/socket never completes,
-        // which leaves VoiceState stuck on Processing with no Listening waveform.
-        using (var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
-        {
-            connectCts.CancelAfter(TimeSpan.FromSeconds(30));
-            try
-            {
-                await _ws.ConnectAsync(url, connectCts.Token).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-            {
-                TryAbortSocket();
-                throw new TimeoutException(
-                    $"Timed out connecting to AssemblyAI ({url.Host}) after 30s. Try another network/VPN or check firewall blocking wss.");
-            }
-        }
-
-        AppDebugLog.Write("AssemblyAI: socket open, awaiting session Begin frame…");
-
-        // Start the receive loop in the background
-        _ = Task.Run(() => ReceiveLoopAsync(CancellationToken.None));
-
-        try
-        {
-            await _readyTcs.Task.WaitAsync(TimeSpan.FromSeconds(45), ct).ConfigureAwait(false);
-        }
-        catch (TimeoutException)
-        {
-            TryAbortSocket();
-            throw new TimeoutException(
-                "AssemblyAI opened the socket but never sent a Begin/control frame within 45s.");
-        }
-
-        AppDebugLog.Write("AssemblyAI: Begin received — ready for audio.");
 
         void TryAbortSocket()
         {
             try { _ws?.Abort(); }
             catch { /* no-op */ }
         }
+
+        using (ct.Register(TryAbortSocket))
+        {
+            AppDebugLog.Write($"AssemblyAI: connecting WebSocket to {url.Host}…");
+
+            // ConnectAsync has been observed to hang indefinitely on some networks if the TLS/socket never completes,
+            // which leaves VoiceState stuck on Processing with no Listening waveform.
+            using (var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                connectCts.CancelAfter(TimeSpan.FromSeconds(30));
+                try
+                {
+                    await _ws.ConnectAsync(url, connectCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    TryAbortSocket();
+                    throw new TimeoutException(
+                        $"Timed out connecting to AssemblyAI ({url.Host}) after 30s. Try another network/VPN or check firewall blocking wss.");
+                }
+            }
+
+            AppDebugLog.Write("AssemblyAI: socket open, awaiting session Begin frame…");
+
+            // Start the receive loop in the background
+            _ = Task.Run(() => ReceiveLoopAsync(CancellationToken.None));
+
+            try
+            {
+                await _readyTcs.Task.WaitAsync(TimeSpan.FromSeconds(45), ct).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                TryAbortSocket();
+                throw new TimeoutException(
+                    "AssemblyAI opened the socket but never sent a Begin/control frame within 45s.");
+            }
+            catch (OperationCanceledException)
+            {
+                TryAbortSocket();
+                throw;
+            }
+        }
+
+        AppDebugLog.Write("AssemblyAI: Begin received — ready for audio.");
     }
 
     // ── Audio ─────────────────────────────────────────────────────────────────
@@ -232,6 +244,7 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
         }
 
         _ = SendJsonAsync(new { type = "ForceEndpoint" });
+        AppDebugLog.Write("AssemblyAI: ForceEndpoint sent; grace period started.");
     }
 
     public void Cancel()
@@ -296,6 +309,8 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
             using var doc = JsonDocument.Parse(text);
             var root = doc.RootElement;
             var type = root.GetProperty("type").GetString()?.ToLowerInvariant() ?? "";
+
+            AppDebugLog.Write($"AssemblyAI WS← type=\"{type}\" len={text.Length}");
 
             switch (type)
             {
@@ -475,6 +490,8 @@ internal sealed class AssemblyAISession : IStreamingTranscriptionSession
             _gracePeriodCts?.Cancel();
             _gracePeriodCts = null;
         }
+
+        AppDebugLog.Write($"AssemblyAI: delivering final transcript ({text.Length} chars): \"{text.Truncate(80)}\"");
 
         try
         {

@@ -29,4 +29,10 @@
     </None>
   </ItemGroup>
 
+  <ItemGroup>
+    <Compile Remove="MicTest\**" />
+    <None Remove="MicTest\**" />
+    <EmbeddedResource Remove="MicTest\**" />
+  </ItemGroup>
+
 </Project>

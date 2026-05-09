@@ -72,7 +72,7 @@ public sealed partial class TrayPopupWindow : Window
     private void RefreshStatusUi()
     {
         bool active = _manager.IsOverlayVisible;
-        StatusLabel.Text = active ? "Active — Ctrl+Alt to talk" : "Ready — show cursor to begin";
+        StatusLabel.Text = active ? "Active — Ctrl+Alt to talk" : "Ready — hold Ctrl+Alt until you see the waveform, then speak";
     }
 
     private void OnVoiceStateChanged(VoiceState _) =>

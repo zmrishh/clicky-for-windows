@@ -83,8 +83,11 @@ public sealed class CompanionManager : IDisposable
     private AssemblyAIStreamingProvider _assemblyAiProvider;
     private ElevenLabsTtsClient _ttsClient;
 
-    /// <summary>Invalidates <see cref="StartPushToTalkSession"/> while still connecting.</summary>
+    /// <summary>Invalidates <see cref="StartPushToTalkSession"/> when the user starts a new hold while one is still preparing.</summary>
     private Guid _pttPrepareId = Guid.Empty;
+
+    /// <summary>Cancels in-flight Worker + AssemblyAI handshake when the user releases Ctrl+Alt before listening starts.</summary>
+    private CancellationTokenSource? _pttPrepareAbortSource;
 
     /// <summary>Avoids spamming the user if they mash Ctrl+Alt without mic permission.</summary>
     private DateTime _lastMicrophoneNeededHintUtc = DateTime.MinValue;
@@ -219,6 +222,9 @@ public sealed class CompanionManager : IDisposable
     {
         _hotkeyMonitor.Stop();
         AbortActiveResponseWorkflow();
+        _pttPrepareAbortSource?.Cancel();
+        _pttPrepareAbortSource?.Dispose();
+        _pttPrepareAbortSource = null;
         _permissionTimer?.Stop();
         StopRecordingSession();
         _overlayManager.HideOverlay();
@@ -299,33 +305,18 @@ public sealed class CompanionManager : IDisposable
 
     public void RequestMicrophonePermission()
     {
-        Task.Run(async () =>
+        Task.Run(() =>
         {
-            // Windows 10+ mic permission: attempt to open a capture device.
-            // The OS shows a consent prompt if this is the first time.
-            try
-            {
-                using var capture = new NAudio.CoreAudioApi.WasapiCapture();
-                await Task.Delay(100);
-            }
+            try { _ = NAudio.Wave.WaveIn.DeviceCount; }
             catch { }
-
             WpfApp.Current.Dispatcher.Invoke(RefreshPermissions);
         });
     }
 
     private bool CheckMicrophonePermission()
     {
-        // WasapiCapture initialises without throwing if permission is granted.
-        try
-        {
-            using var capture = new NAudio.CoreAudioApi.WasapiCapture();
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
+        try { return NAudio.Wave.WaveIn.DeviceCount > 0; }
+        catch { return false; }
     }
 
     private void StartPermissionPolling()
@@ -402,6 +393,11 @@ public sealed class CompanionManager : IDisposable
     {
         if (!HasMicrophonePermission) return;
 
+        _pttPrepareAbortSource?.Cancel();
+        _pttPrepareAbortSource?.Dispose();
+        _pttPrepareAbortSource = new CancellationTokenSource();
+        var handshakeAbortToken = _pttPrepareAbortSource.Token;
+
         var prepareId = Guid.NewGuid();
         _pttPrepareId = prepareId;
 
@@ -411,7 +407,10 @@ public sealed class CompanionManager : IDisposable
         Task.Run(async () =>
         {
             using var prepareTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(75));
-            var ct = prepareTimeout.Token;
+            using var linkedLifetime = CancellationTokenSource.CreateLinkedTokenSource(
+                handshakeAbortToken,
+                prepareTimeout.Token);
+            var ct = linkedLifetime.Token;
 
             try
             {
@@ -422,7 +421,7 @@ public sealed class CompanionManager : IDisposable
                     onTranscriptUpdate: _ => { },
                     onFinalTranscriptReady: OnFinalTranscriptReady,
                     onError: OnTranscriptionError,
-                    ct);
+                    ct).ConfigureAwait(false);
 
                 await WpfApp.Current.Dispatcher.InvokeAsync(() =>
                 {
@@ -432,9 +431,22 @@ public sealed class CompanionManager : IDisposable
                         return;
                     }
 
+                    if (handshakeAbortToken.IsCancellationRequested)
+                    {
+                        session.Cancel();
+                        AppDebugLog.Write("PTT: handshake finished but keys were released — discarding stray session attach.");
+                        _isPreparing = false;
+                        VoiceState = VoiceState.Idle;
+                        ScheduleTransientHideIfNeeded();
+                        return;
+                    }
+
                     _activeSession = session;
                     _isRecording = true;
                     _isPreparing = false;
+                    _audioChunksSent = 0;
+
+                    ReleasePrepareAbortHandlesCommit();
 
                     // Switch to waveform ASAP; microphone errors are handled separately below.
                     VoiceState = VoiceState.Listening;
@@ -443,6 +455,27 @@ public sealed class CompanionManager : IDisposable
                     {
                         _audioCapture.Start();
                         AppDebugLog.Write("AssemblyAI session ready → recording (listening).");
+
+                        // Watchdog: if no audio chunks arrive within 2s the capture device is
+                        // silently broken (driver/exclusive-mode issue).
+                        _ = Task.Run(async () =>
+                        {
+                            await Task.Delay(2000).ConfigureAwait(false);
+                            if (_isRecording && _audioChunksSent == 0)
+                            {
+                                AppDebugLog.Write("AudioCapture WATCHDOG: 2s elapsed, 0 chunks — mic not delivering audio.");
+                                await WpfApp.Current.Dispatcher.InvokeAsync(() =>
+                                {
+                                    if (!_isRecording) return;
+                                    ShowDiagnostic(
+                                        "Microphone is not delivering audio.\r\n\r\n" +
+                                        "• Windows Settings → Privacy → Microphone → allow desktop apps\r\n" +
+                                        "• Close Teams, Discord, or any app with exclusive mic access\r\n" +
+                                        "• Check recording device volume in Windows Sound settings",
+                                        isError: true);
+                                });
+                            }
+                        });
                     }
                     catch (Exception micEx)
                     {
@@ -456,27 +489,55 @@ public sealed class CompanionManager : IDisposable
                             "Pick a working microphone in Windows Settings → System → Sound → Input, then try Ctrl+Alt again.",
                             isError: true);
                     }
-                });
+                }, DispatcherPriority.Send);
             }
-            catch (OperationCanceledException) when (prepareTimeout.Token.IsCancellationRequested)
+            catch (OperationCanceledException)
             {
-                AppDebugLog.Write("PTT: prepare timed out (75s overall) waiting for Worker + AssemblyAI.");
                 await WpfApp.Current.Dispatcher.InvokeAsync(() =>
                 {
+                    if (_pttPrepareId != prepareId)
+                    {
+                        AppDebugLog.Write("PTT: stale prepare task exited (another PTT superseded it).");
+                        return;
+                    }
+
                     _isPreparing = false;
                     VoiceState = VoiceState.Idle;
-                    ShowDiagnostic(
-                        "Connecting to the speech service took too long.\r\n\r\n" +
-                        "Check Internet, VPN/firewall (outbound WebSocket TLS to streaming.assemblyai.com), Worker URL,\r\n" +
-                        "and `clicky-debug.log` under %AppData%\\Roaming\\Clicky\\.",
-                        isError: true);
-                });
+
+                    var timedOutOverall = prepareTimeout.Token.IsCancellationRequested;
+                    var abortedEarly = handshakeAbortToken.IsCancellationRequested;
+
+                    if (timedOutOverall)
+                    {
+                        AppDebugLog.Write("PTT: prepare timed out (75s) waiting for Worker + AssemblyAI.");
+                        ShowDiagnostic(
+                            "Connecting to the speech service took too long.\r\n\r\n" +
+                            "Check Internet, VPN/firewall (outbound WebSocket TLS to streaming.assemblyai.com), Worker URL,\r\n" +
+                            "and `clicky-debug.log` under %AppData%\\Roaming\\Clicky\\.",
+                            isError: true);
+                        return;
+                    }
+
+                    if (abortedEarly)
+                    {
+                        AppDebugLog.Write(
+                            "PTT: released Ctrl+Alt while still connecting. Hold both keys until you see the waveform, then speak.");
+                        ScheduleTransientHideIfNeeded();
+                        return;
+                    }
+
+                    AppDebugLog.Write("PTT: prepare canceled.");
+                    ScheduleTransientHideIfNeeded();
+                }, DispatcherPriority.Send);
             }
             catch (TimeoutException tex)
             {
                 Console.WriteLine($"[PTT] Timeout: {tex.Message}");
                 await WpfApp.Current.Dispatcher.InvokeAsync(() =>
                 {
+                    if (_pttPrepareId != prepareId)
+                        return;
+
                     _isPreparing = false;
                     VoiceState = VoiceState.Idle;
                     ShowDiagnostic(
@@ -484,31 +545,45 @@ public sealed class CompanionManager : IDisposable
                         "Verify your Worker exposes POST /transcribe-token with a valid AssemblyAI key. " +
                         "If you are on restrictive Wi‑Fi, try another network or VPN.",
                         isError: true);
-                });
+                }, DispatcherPriority.Send);
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[PTT] Failed to start session: {ex.Message}");
                 await WpfApp.Current.Dispatcher.InvokeAsync(() =>
                 {
+                    if (_pttPrepareId != prepareId)
+                        return;
+
                     _isPreparing = false;
                     VoiceState = VoiceState.Idle;
                     ShowDiagnostic(
                         $"Could not start transcription (microphone/network or Worker).\r\n\r\n{ex.Message}\r\n\r\n" +
                         $"Check your Worker URL in the tray menu and verify AssemblyAI/ElevenLabs secrets on the Worker.",
                         isError: true);
-                });
+                }, DispatcherPriority.Send);
             }
         });
+    }
+
+    /// <summary>Handshake finished and session is attaching or attached — disposed so release during record doesn't cancel unrelated work.</summary>
+    private void ReleasePrepareAbortHandlesCommit()
+    {
+        try
+        {
+            _pttPrepareAbortSource?.Dispose();
+        }
+        catch (ObjectDisposedException) { /* no-op */ }
+
+        _pttPrepareAbortSource = null;
     }
 
     private void StopPushToTalkSession()
     {
         if (!_isRecording && !_isPreparing) return;
 
-        bool wasPreparing = _isPreparing;
-        if (wasPreparing)
-            _pttPrepareId = Guid.Empty;
+        if (_isPreparing)
+            _pttPrepareAbortSource?.Cancel();
 
         _isRecording = false;
         _isPreparing = false;
@@ -517,6 +592,8 @@ public sealed class CompanionManager : IDisposable
 
         _audioCapture.Stop();
 
+        AppDebugLog.Write($"PTT key-up: chunks sent={_audioChunksSent} peakLevel={AudioPowerLevel:F3}");
+
         // If the user releases before the WebSocket session is assigned, RequestFinalTranscript is a no-op and
         // OnFinalTranscriptReady will never run — do NOT start the stall timer (it would false-positive every time).
         var session = _activeSession;
@@ -524,7 +601,9 @@ public sealed class CompanionManager : IDisposable
 
         if (session == null)
         {
-            AppDebugLog.Write("PTT: released before AssemblyAI session was ready — no final transcript to wait for.");
+            AppDebugLog.Write(
+                "PTT: stopped before session attached (released early or spurious Ctrl+Alt up while connecting). " +
+                "Hold until the waveform; no transcript to finalize.");
             _isFinalizingTranscript = false;
             VoiceState = VoiceState.Idle;
             ScheduleTransientHideIfNeeded();
@@ -570,11 +649,19 @@ public sealed class CompanionManager : IDisposable
 
     // ── Audio data pipeline ───────────────────────────────────────────────────
 
+    private int _audioChunksSent;
+
     private void OnAudioDataAvailable(byte[] pcm16Data)
     {
-        _activeSession?.AppendAudioData(pcm16Data);
+        var session = _activeSession;
+        if (session == null) return;
 
-        // Update power level on UI thread
+        session.AppendAudioData(pcm16Data);
+
+        var count = System.Threading.Interlocked.Increment(ref _audioChunksSent);
+        if (count == 1 || count % 50 == 0)
+            AppDebugLog.Write($"Audio→AssemblyAI chunk #{count} ({pcm16Data.Length} bytes)");
+
         var level = _audioCapture.AudioPowerLevel;
         WpfApp.Current.Dispatcher.InvokeAsync(() =>
         {

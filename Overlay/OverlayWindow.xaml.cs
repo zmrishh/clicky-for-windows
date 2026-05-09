@@ -232,17 +232,20 @@ public sealed partial class OverlayWindow : Window
 
         bool isOnThis = IsCursorOnThisScreen();
 
-        // Only show visual on this screen when cursor is here (or navigating here)
-        bool visible = _navMode != BuddyNavigationMode.FollowingCursor || isOnThis;
-        // If another screen is running a navigation, hide here to avoid duplicate
+        // Cursor + triangle follow the active monitor only; hide duplicate chrome while pointing.
+        bool navChromeVisible = _navMode != BuddyNavigationMode.FollowingCursor || isOnThis;
         if (_navMode == BuddyNavigationMode.FollowingCursor && _manager.HasDetectedElement)
-            visible = false;
+            navChromeVisible = false;
+
+        // Spinner + waveform indicate connect/listen globally — show on every monitor so a cursor on
+        // another desktop does not look "stuck forever" with no feedback on the display you are watching.
+        bool pttChromeVisible = showSpinner || showWaveform;
 
         var dur = TimeSpan.FromSeconds(0.2);
 
-        FadeTo(CursorTriangle,  showTriangle && visible  ? 1.0 : 0.0, dur);
-        FadeTo(WaveformCanvas,  showWaveform && visible  ? 1.0 : 0.0, dur);
-        FadeTo(SpinnerCanvas,   showSpinner  && visible  ? 1.0 : 0.0, dur);
+        FadeTo(CursorTriangle,  showTriangle && navChromeVisible ? 1.0 : 0.0, dur);
+        FadeTo(WaveformCanvas,  showWaveform && pttChromeVisible ? 1.0 : 0.0, dur);
+        FadeTo(SpinnerCanvas,   showSpinner && pttChromeVisible ? 1.0 : 0.0, dur);
     }
 
     private void OnAudioPowerLevelChanged(float level)
