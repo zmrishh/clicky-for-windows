@@ -46,6 +46,12 @@ internal static class AppConstants
     public const double PointingHoldSeconds = 3.0;
     public const double NavigationCancelDistanceDip = 100.0;
 
+    // Action execution
+    /// <summary>Default pause between sequential action steps (page-load buffer).</summary>
+    public const int ActionStepPauseMs = 1200;
+    /// <summary>Toast display duration before each action fires.</summary>
+    public const int ActionToastHoldMs = 1200;
+
     // Persistence
     public const string SettingsFileName = "settings.json";
     public static string SettingsDirectory =>

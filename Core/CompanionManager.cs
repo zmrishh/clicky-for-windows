@@ -832,7 +832,7 @@ public sealed class CompanionManager : IDisposable
                 var parseResult  = PointingParseResult.Parse(fullText);
                 var actionResult = ActionTagParser.Parse(parseResult.SpokenText);
 
-                // Guarantee spokenText is never empty — Claude sometimes returns only a tag
+                // Guarantee spokenText is never empty — Claude sometimes returns only tags
                 var spokenText = string.IsNullOrWhiteSpace(actionResult.SpokenText)
                     ? actionResult.Action switch
                     {
@@ -866,10 +866,10 @@ public sealed class CompanionManager : IDisposable
 
                 cts.Token.ThrowIfCancellationRequested();
 
-                // 9. Execute action (with countdown toast) if Claude requested one
-                if (actionResult.Action != null)
+                // 9. Execute all action steps sequentially (re-screenshots between each click)
+                if (actionResult.HasActions)
                 {
-                    await ExecuteActionWithToastAsync(actionResult.Action, captures, cts.Token);
+                    await ExecuteActionsAsync(actionResult.Actions, captures, cts.Token);
                 }
 
                 // 10. TTS — spokenText is always non-empty at this point
@@ -996,33 +996,80 @@ public sealed class CompanionManager : IDisposable
     // ── Action execution ──────────────────────────────────────────────────────
 
     /// <summary>
-    /// Shows a 1.5-second countdown toast on the overlay then executes the action.
-    /// Translates Claude's screenshot-pixel coordinates to physical screen pixels
-    /// using the same scaling logic as HandlePointingTag.
+    /// Executes all action steps returned by Claude in sequence.
+    /// Between each step: take a fresh screenshot so coordinates for subsequent
+    /// clicks reflect the updated page state (navigation, menus, etc.).
     /// </summary>
-    private async Task ExecuteActionWithToastAsync(
-        ActionTag action,
-        List<ScreenCaptureData> captures,
+    private async Task ExecuteActionsAsync(
+        List<ActionTag> actions,
+        List<ScreenCaptureData> initialCaptures,
         CancellationToken ct)
     {
-        string toastMessage = action switch
+        var captures = initialCaptures;
+
+        for (int i = 0; i < actions.Count; i++)
         {
-            ActionTag.Click c  => c.RightClick ? "right-clicking..." : "clicking...",
-            ActionTag.Type  t  => $"typing: {t.Text.Truncate(30)}",
-            ActionTag.Open  o  => $"opening {o.AppName}...",
-            _                  => "executing..."
+            ct.ThrowIfCancellationRequested();
+            var action = actions[i];
+
+            // WAIT steps: no toast, just pause
+            if (action is ActionTag.Wait wait)
+            {
+                AppDebugLog.Write($"Action step {i + 1}/{actions.Count}: waiting {wait.Milliseconds}ms");
+                await Task.Delay(wait.Milliseconds, ct);
+                captures = await Task.Run(ScreenCaptureService.CaptureAllScreens, ct);
+                continue;
+            }
+
+            string label = StepLabel(action, i + 1, actions.Count);
+            AppDebugLog.Write($"Action step {i + 1}/{actions.Count}: {label}");
+
+            // Show toast and wait for it to complete before executing
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            WpfApp.Current.Dispatcher.Invoke(() =>
+                _overlayManager.ShowActionToast(label, AppConstants.ActionToastHoldMs, () => tcs.TrySetResult(true)));
+            await tcs.Task.WaitAsync(ct);
+            ct.ThrowIfCancellationRequested();
+
+            // Execute the step
+            ExecuteStep(action, captures);
+
+            // If there are more non-WAIT steps coming, pause and re-screenshot
+            // so the next click targets the fresh page state
+            bool moreActionsAhead = actions.Skip(i + 1).Any(a => a is not ActionTag.Wait);
+            if (moreActionsAhead)
+            {
+                int pauseMs = AppConstants.ActionStepPauseMs;
+
+                // Look ahead: if next tag is an explicit WAIT, use its value instead
+                if (i + 1 < actions.Count && actions[i + 1] is ActionTag.Wait nextWait)
+                {
+                    pauseMs = nextWait.Milliseconds;
+                    i++; // skip the WAIT tag in the loop
+                }
+
+                AppDebugLog.Write($"Action step {i + 1}/{actions.Count}: pausing {pauseMs}ms then re-screenshotting");
+                await Task.Delay(pauseMs, ct);
+                captures = await Task.Run(ScreenCaptureService.CaptureAllScreens, ct);
+                AppDebugLog.Write($"Action step: fresh screenshot captured after pause");
+            }
+        }
+    }
+
+    private static string StepLabel(ActionTag action, int step, int total)
+    {
+        string suffix = total > 1 ? $" ({step}/{total})" : "";
+        return action switch
+        {
+            ActionTag.Click c  => c.RightClick ? $"right-clicking...{suffix}" : $"clicking...{suffix}",
+            ActionTag.Type  t  => $"typing: {t.Text.Truncate(28)}{suffix}",
+            ActionTag.Open  o  => $"opening {o.AppName}...{suffix}",
+            _                  => $"executing...{suffix}"
         };
+    }
 
-        AppDebugLog.Write($"Action: {toastMessage}");
-
-        // Show toast for 1500ms then execute
-        var tcs = new TaskCompletionSource<bool>();
-        WpfApp.Current.Dispatcher.Invoke(() =>
-            _overlayManager.ShowActionToast(toastMessage, 1500, () => tcs.TrySetResult(true)));
-
-        await tcs.Task.WaitAsync(ct);
-        ct.ThrowIfCancellationRequested();
-
+    private static void ExecuteStep(ActionTag action, List<ScreenCaptureData> captures)
+    {
         switch (action)
         {
             case ActionTag.Click click:
@@ -1301,17 +1348,26 @@ public sealed class CompanionManager : IDisposable
         if pointing wouldn't help, append [POINT:none].
 
         performing actions:
-        you can also do things on screen — click buttons, type text, or open applications. only use actions when the user explicitly asks you to do something (e.g. "click that", "open notepad", "type hello"). never act without being asked.
+        you can do things on screen — click buttons, type text, open applications, or chain multiple steps. only use actions when the user explicitly asks you to do something. never act without being asked.
 
-        to perform an action, append ONE action tag after your spoken text (before or instead of a POINT tag):
-        - [CLICK:x,y] — left-click at screenshot pixel coordinates x,y on the cursor's screen
+        available action tags (append after your spoken text):
+        - [CLICK:x,y] — left-click at screenshot pixel coordinates x,y
         - [CLICK:x,y:right] — right-click at x,y
-        - [TYPE:the text to type] — type text into the currently focused window
-        - [OPEN:app name] — launch an application by name (e.g. notepad, calculator, chrome)
+        - [TYPE:the text to type] — type text into the focused window
+        - [OPEN:app name] — launch an application (e.g. notepad, chrome, brave)
+        - [WAIT:ms] — pause for ms milliseconds before the next step (use when a page or app needs time to load)
 
-        CRITICAL: always write spoken text first. the action tag is always at the very end — never start your response with a tag. for example: "sure, clicking that for you. [CLICK:342,180]" — not "[CLICK:342,180]". if you omit the spoken text, nothing will be spoken aloud and the user gets no feedback.
+        multi-step tasks: if the user asks you to do several things in sequence (e.g. "open npm, go to packages, click the package"), append ALL action tags in order in a single response, separated by spaces. clicky will execute them one after the other, taking a fresh screenshot between each step so your coordinates are accurate.
 
-        use screenshot pixel coordinates for CLICK, the same coordinate space as POINT. you can combine a POINT tag with an action tag on the same response if it helps the user see what you're about to do. put the action tag first, then the POINT tag at the very end.
+        example — "open brave and go to the settings tab":
+        "sure, opening brave and navigating to settings. [OPEN:brave] [WAIT:1500] [CLICK:600,42]"
+
+        example — "click submit and then close the tab":
+        "clicking submit then closing the tab. [CLICK:342,600] [WAIT:800] [CLICK:430,15]"
+
+        CRITICAL: always write spoken text first — never start with a tag. coordinates must come from the current screenshot. when estimating click targets, look at the screenshot carefully and pick the center of the element.
+
+        you can also combine with a POINT tag: spoken text → action tags → [POINT:x,y:label] at the very end.
         """;
 
 

@@ -5,19 +5,26 @@ namespace ClickyWindows.Core;
 /// <summary>
 /// Parses action tags that Claude appends to its response.
 ///
-/// Supported tags (case-insensitive, appear after spoken text):
+/// Supported tags (case-insensitive, appear after spoken text, in any order/quantity):
 ///   [CLICK:x,y]            — left-click at screenshot pixel (x, y)
 ///   [CLICK:x,y:right]      — right-click at (x, y)
 ///   [TYPE:text to inject]  — type text into focused window
 ///   [OPEN:app name]        — launch application by name
+///   [WAIT:ms]              — pause for the given milliseconds before the next step
 ///
-/// Tags are stripped before the spoken text is passed to TTS.
-/// At most one action tag per response is executed.
+/// Multiple tags are returned in document order so callers can execute them as a sequence.
+/// All tags are stripped from the spoken text before it is passed to TTS.
 /// </summary>
 public sealed class ActionParseResult
 {
-    public string    SpokenText  { get; init; } = "";
-    public ActionTag? Action     { get; init; }
+    public string          SpokenText { get; init; } = "";
+    public List<ActionTag> Actions    { get; init; } = [];
+
+    /// <summary>True when there is at least one executable action tag.</summary>
+    public bool HasActions => Actions.Count > 0;
+
+    /// <summary>Backwards-compat helper: first action or null.</summary>
+    public ActionTag? Action => Actions.Count > 0 ? Actions[0] : null;
 }
 
 public abstract class ActionTag
@@ -38,76 +45,70 @@ public abstract class ActionTag
     {
         public string AppName { get; init; } = "";
     }
+
+    /// <summary>Pause for <see cref="Milliseconds"/> before the next step.</summary>
+    public sealed class Wait : ActionTag
+    {
+        public int Milliseconds { get; init; }
+    }
 }
 
 public static class ActionTagParser
 {
-    // Matches [CLICK:123,456], [CLICK:123,456:right]
-    private static readonly Regex ClickRegex = new(
-        @"\[CLICK\s*:\s*(\d+)\s*,\s*(\d+)(?:\s*:\s*(right))?\]",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled);
-
-    // Matches [TYPE:some text here]
-    private static readonly Regex TypeRegex = new(
-        @"\[TYPE\s*:\s*([^\]]+)\]",
-        RegexOptions.IgnoreCase | RegexOptions.Compiled);
-
-    // Matches [OPEN:notepad] or [OPEN:visual studio code]
-    private static readonly Regex OpenRegex = new(
-        @"\[OPEN\s*:\s*([^\]]+)\]",
+    // Each pattern captures its tag content so we can reconstruct position in the string.
+    private static readonly Regex AnyTagRegex = new(
+        @"\[(?:" +
+            @"(CLICK)\s*:\s*(\d+)\s*,\s*(\d+)(?:\s*:\s*(right))?" +     // group 1-4
+            @"|" +
+            @"(TYPE)\s*:\s*([^\]]+)" +                                    // group 5-6
+            @"|" +
+            @"(OPEN)\s*:\s*([^\]]+)" +                                    // group 7-8
+            @"|" +
+            @"(WAIT)\s*:\s*(\d+)" +                                       // group 9-10
+        @")\]",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     /// <summary>
-    /// Parses action tags from Claude's full response text.
-    /// Returns the spoken text (tags stripped) and the first action found, if any.
+    /// Parses all action tags from Claude's response text.
+    /// Returns the spoken text (tags stripped) and all actions in document order.
     /// </summary>
     public static ActionParseResult Parse(string fullText)
     {
         if (string.IsNullOrWhiteSpace(fullText))
             return new ActionParseResult { SpokenText = fullText };
 
-        ActionTag? action = null;
-        string stripped = fullText;
-
-        // Try CLICK
-        var clickMatch = ClickRegex.Match(stripped);
-        if (clickMatch.Success)
+        var actions = new List<ActionTag>();
+        var stripped = AnyTagRegex.Replace(fullText, match =>
         {
-            action  = new ActionTag.Click
+            if (match.Groups[1].Success) // CLICK
             {
-                X          = int.Parse(clickMatch.Groups[1].Value),
-                Y          = int.Parse(clickMatch.Groups[2].Value),
-                RightClick = clickMatch.Groups[3].Success
-            };
-            stripped = stripped.Remove(clickMatch.Index, clickMatch.Length).Trim();
-        }
-
-        // Try TYPE
-        if (action == null)
-        {
-            var typeMatch = TypeRegex.Match(stripped);
-            if (typeMatch.Success)
-            {
-                action  = new ActionTag.Type { Text = typeMatch.Groups[1].Value.Trim() };
-                stripped = stripped.Remove(typeMatch.Index, typeMatch.Length).Trim();
+                actions.Add(new ActionTag.Click
+                {
+                    X          = int.Parse(match.Groups[2].Value),
+                    Y          = int.Parse(match.Groups[3].Value),
+                    RightClick = match.Groups[4].Success
+                });
             }
-        }
-
-        // Try OPEN
-        if (action == null)
-        {
-            var openMatch = OpenRegex.Match(stripped);
-            if (openMatch.Success)
+            else if (match.Groups[5].Success) // TYPE
             {
-                action  = new ActionTag.Open { AppName = openMatch.Groups[1].Value.Trim() };
-                stripped = stripped.Remove(openMatch.Index, openMatch.Length).Trim();
+                actions.Add(new ActionTag.Type { Text = match.Groups[6].Value.Trim() });
             }
-        }
+            else if (match.Groups[7].Success) // OPEN
+            {
+                actions.Add(new ActionTag.Open { AppName = match.Groups[8].Value.Trim() });
+            }
+            else if (match.Groups[9].Success) // WAIT
+            {
+                if (int.TryParse(match.Groups[10].Value, out int ms))
+                    actions.Add(new ActionTag.Wait { Milliseconds = Math.Clamp(ms, 0, 30_000) });
+            }
+            return ""; // remove the tag from the text
+        });
 
         return new ActionParseResult
         {
             SpokenText = stripped.Trim(),
-            Action     = action
+            Actions    = actions
         };
     }
 }
