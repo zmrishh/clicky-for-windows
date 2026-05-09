@@ -11,6 +11,7 @@ namespace ClickyWindows.Core;
 ///   [TYPE:text to inject]  — type text into focused window
 ///   [OPEN:app name]        — launch application by name
 ///   [WAIT:ms]              — pause for the given milliseconds before the next step
+///   [DONE]                 — task is complete, stop the agent loop
 ///
 /// Multiple tags are returned in document order so callers can execute them as a sequence.
 /// All tags are stripped from the spoken text before it is passed to TTS.
@@ -19,6 +20,9 @@ public sealed class ActionParseResult
 {
     public string          SpokenText { get; init; } = "";
     public List<ActionTag> Actions    { get; init; } = [];
+
+    /// <summary>True when Claude signalled the task is fully complete.</summary>
+    public bool IsDone { get; init; }
 
     /// <summary>True when there is at least one executable action tag.</summary>
     public bool HasActions => Actions.Count > 0;
@@ -55,16 +59,17 @@ public abstract class ActionTag
 
 public static class ActionTagParser
 {
-    // Each pattern captures its tag content so we can reconstruct position in the string.
     private static readonly Regex AnyTagRegex = new(
         @"\[(?:" +
-            @"(CLICK)\s*:\s*(\d+)\s*,\s*(\d+)(?:\s*:\s*(right))?" +     // group 1-4
+            @"(CLICK)\s*:\s*(\d+)\s*,\s*(\d+)(?:\s*:\s*(right))?" +    // 1-4: CLICK
             @"|" +
-            @"(TYPE)\s*:\s*([^\]]+)" +                                    // group 5-6
+            @"(TYPE)\s*:\s*([^\]]+)" +                                   // 5-6: TYPE
             @"|" +
-            @"(OPEN)\s*:\s*([^\]]+)" +                                    // group 7-8
+            @"(OPEN)\s*:\s*([^\]]+)" +                                   // 7-8: OPEN
             @"|" +
-            @"(WAIT)\s*:\s*(\d+)" +                                       // group 9-10
+            @"(WAIT)\s*:\s*(\d+)" +                                      // 9-10: WAIT
+            @"|" +
+            @"(DONE)" +                                                   // 11: DONE
         @")\]",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
@@ -78,6 +83,8 @@ public static class ActionTagParser
             return new ActionParseResult { SpokenText = fullText };
 
         var actions = new List<ActionTag>();
+        bool isDone = false;
+
         var stripped = AnyTagRegex.Replace(fullText, match =>
         {
             if (match.Groups[1].Success) // CLICK
@@ -102,13 +109,18 @@ public static class ActionTagParser
                 if (int.TryParse(match.Groups[10].Value, out int ms))
                     actions.Add(new ActionTag.Wait { Milliseconds = Math.Clamp(ms, 0, 30_000) });
             }
-            return ""; // remove the tag from the text
+            else if (match.Groups[11].Success) // DONE
+            {
+                isDone = true;
+            }
+            return "";
         });
 
         return new ActionParseResult
         {
             SpokenText = stripped.Trim(),
-            Actions    = actions
+            Actions    = actions,
+            IsDone     = isDone
         };
     }
 }

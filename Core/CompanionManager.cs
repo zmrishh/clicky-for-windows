@@ -833,15 +833,7 @@ public sealed class CompanionManager : IDisposable
                 var actionResult = ActionTagParser.Parse(parseResult.SpokenText);
 
                 // Guarantee spokenText is never empty — Claude sometimes returns only tags
-                var spokenText = string.IsNullOrWhiteSpace(actionResult.SpokenText)
-                    ? actionResult.Action switch
-                    {
-                        ActionTag.Click c  => c.RightClick ? "right-clicking." : "clicking.",
-                        ActionTag.Type  _  => "typing that for you.",
-                        ActionTag.Open  o  => $"opening {o.AppName}.",
-                        _                  => "done."
-                    }
-                    : actionResult.SpokenText;
+                var spokenText = BuildSpokenText(actionResult);
 
                 // 6. Show response in the blue NavBubble
                 WpfApp.Current.Dispatcher.Invoke(() =>
@@ -850,12 +842,11 @@ public sealed class CompanionManager : IDisposable
                 // 7. Coordinate translation — switch to UI thread for state mutation
                 await WpfApp.Current.Dispatcher.InvokeAsync(() =>
                 {
-                    // Re-parse pointing from the action-stripped text so both can coexist
                     var pointResult = PointingParseResult.Parse(fullText);
                     HandlePointingTag(pointResult, captures);
                 });
 
-                // 8. Update conversation history
+                // 8. Update conversation history (initial turn only)
                 WpfApp.Current.Dispatcher.Invoke(() =>
                 {
                     _history.Add((transcript, spokenText));
@@ -866,31 +857,16 @@ public sealed class CompanionManager : IDisposable
 
                 cts.Token.ThrowIfCancellationRequested();
 
-                // 9. Execute all action steps sequentially (re-screenshots between each click)
-                if (actionResult.HasActions)
+                // 9. TTS for initial response — fire concurrently while actions run
+                var ttsTask = RunTtsAsync(spokenText, cts.Token);
+
+                // 10. Execute initial actions then run the agentic continuation loop
+                if (actionResult.HasActions && !actionResult.IsDone)
                 {
-                    await ExecuteActionsAsync(actionResult.Actions, captures, cts.Token);
+                    await RunAgentLoopAsync(transcript, actionResult, captures, cts.Token);
                 }
 
-                // 10. TTS — spokenText is always non-empty at this point
-                AppDebugLog.Write($"TTS: speaking chars={spokenText.Trim().Length}.");
-                try
-                {
-                    await _ttsClient.SpeakAsync(spokenText, cts.Token);
-                    WpfApp.Current.Dispatcher.Invoke(() =>
-                    {
-                        if (!cts.IsCancellationRequested)
-                            VoiceState = VoiceState.Responding;
-                    });
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    Console.WriteLine($"⚠️ TTS error: {ex.Message}");
-                    ElevenLabsTtsClient.SpeakFallback(
-                        "I'm all out of credits. Please tell whoever set this up to top them up.");
-                    WpfApp.Current.Dispatcher.Invoke(() =>
-                        VoiceState = VoiceState.Responding);
-                }
+                await ttsTask;
 
                 WpfApp.Current.Dispatcher.Invoke(() =>
                 {
@@ -993,26 +969,155 @@ public sealed class CompanionManager : IDisposable
         DetectedElementChanged?.Invoke();
     }
 
+    // ── Agent loop ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Agentic execution loop.
+    ///
+    /// Executes the actions Claude returned, then re-screenshots and calls Claude again
+    /// with a continuation prompt until Claude signals [DONE] or returns no actions.
+    /// This means each step sees the actual screen state after the previous step, so
+    /// coordinates are always accurate — no pre-planning from a stale screenshot.
+    ///
+    /// Max <see cref="AppConstants.AgentMaxIterations"/> iterations to prevent runaway loops.
+    /// </summary>
+    private async Task RunAgentLoopAsync(
+        string              originalTranscript,
+        ActionParseResult   firstResult,
+        List<ScreenCaptureData> initialCaptures,
+        CancellationToken   ct)
+    {
+        var completedSteps = new List<string>();
+        var current        = firstResult;
+        var captures       = initialCaptures;
+        int iteration      = 0;
+
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (!current.HasActions || current.IsDone)
+            {
+                AppDebugLog.Write($"Agent loop: stopping (IsDone={current.IsDone} HasActions={current.HasActions})");
+                break;
+            }
+
+            if (iteration >= AppConstants.AgentMaxIterations)
+            {
+                AppDebugLog.Write($"Agent loop: hit max iterations ({AppConstants.AgentMaxIterations}), stopping.");
+                break;
+            }
+
+            // Execute this batch of actions; captures are refreshed between each step
+            captures = await ExecuteActionsAsync(current.Actions, captures, ct);
+            iteration++;
+
+            // Record what was done for the continuation context
+            foreach (var a in current.Actions.Where(a => a is not ActionTag.Wait))
+                completedSteps.Add(StepDescription(a));
+
+            if (current.IsDone) break;
+
+            // Re-screenshot and ask Claude what to do next
+            AppDebugLog.Write($"Agent loop: iteration {iteration} complete, asking Claude for next step.");
+            captures = await Task.Run(ScreenCaptureService.CaptureAllScreens, ct);
+
+            var images = captures.Select(c => (
+                Data:  c.ImageBytes,
+                Label: $"{c.Label} (image dimensions: {c.ScreenshotWidthPx}x{c.ScreenshotHeightPx} pixels)"
+            )).ToList();
+
+            string doneList = string.Join(", ", completedSteps);
+            string contPrompt = $"original task: \"{originalTranscript}\"\nsteps completed so far: {doneList}\n\n" +
+                                "look at the current screenshot. what is the single next step to complete the task? " +
+                                "if the full task is now complete, say so and end with [DONE] — no action tags. " +
+                                "otherwise give your brief spoken text + the next action tag(s). " +
+                                "keep spoken text to one sentence.";
+
+            string nextText;
+            try
+            {
+                nextText = await _claudeApi.AnalyzeVisionTextAsync(
+                    images:              images,
+                    systemPrompt:        AgentStepSystemPrompt,
+                    conversationHistory: null,
+                    userPrompt:          contPrompt,
+                    onTextChunk:         _ => { },
+                    cancellationToken:   ct);
+            }
+            catch (Exception ex)
+            {
+                AppDebugLog.Write($"Agent loop: Claude call failed — {ex.Message}");
+                break;
+            }
+
+            AppDebugLog.Write($"Agent loop iteration {iteration}: Claude returned {nextText.Length} chars");
+
+            current = ActionTagParser.Parse(nextText);
+
+            if (!string.IsNullOrWhiteSpace(current.SpokenText))
+            {
+                // Show + speak the step narrative without cluttering the history
+                WpfApp.Current.Dispatcher.Invoke(() =>
+                    _overlayManager.ShowResponse(current.SpokenText));
+                _ = RunTtsAsync(current.SpokenText, ct);
+            }
+        }
+    }
+
+    private static string BuildSpokenText(ActionParseResult r)
+    {
+        if (!string.IsNullOrWhiteSpace(r.SpokenText)) return r.SpokenText;
+        return r.Action switch
+        {
+            ActionTag.Click c  => c.RightClick ? "right-clicking." : "clicking.",
+            ActionTag.Type  _  => "typing that for you.",
+            ActionTag.Open  o  => $"opening {o.AppName}.",
+            null               => "done.",
+            _                  => "on it."
+        };
+    }
+
+    private async Task RunTtsAsync(string text, CancellationToken ct)
+    {
+        AppDebugLog.Write($"TTS: speaking chars={text.Trim().Length}.");
+        try
+        {
+            await _ttsClient.SpeakAsync(text, ct);
+            WpfApp.Current.Dispatcher.Invoke(() =>
+            {
+                if (!ct.IsCancellationRequested)
+                    VoiceState = VoiceState.Responding;
+            });
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            Console.WriteLine($"⚠️ TTS error: {ex.Message}");
+            ElevenLabsTtsClient.SpeakFallback(
+                "I'm all out of credits. Please tell whoever set this up to top them up.");
+            WpfApp.Current.Dispatcher.Invoke(() =>
+                VoiceState = VoiceState.Responding);
+        }
+    }
+
     // ── Action execution ──────────────────────────────────────────────────────
 
     /// <summary>
-    /// Executes all action steps returned by Claude in sequence.
-    /// Between each step: take a fresh screenshot so coordinates for subsequent
-    /// clicks reflect the updated page state (navigation, menus, etc.).
+    /// Executes all action steps in the list sequentially.
+    /// Pauses and re-screenshots between steps so subsequent CLICK coordinates
+    /// reflect the actual screen state.
+    /// Returns the most recent captures (after the last re-screenshot).
     /// </summary>
-    private async Task ExecuteActionsAsync(
+    private async Task<List<ScreenCaptureData>> ExecuteActionsAsync(
         List<ActionTag> actions,
-        List<ScreenCaptureData> initialCaptures,
+        List<ScreenCaptureData> captures,
         CancellationToken ct)
     {
-        var captures = initialCaptures;
-
         for (int i = 0; i < actions.Count; i++)
         {
             ct.ThrowIfCancellationRequested();
             var action = actions[i];
 
-            // WAIT steps: no toast, just pause
             if (action is ActionTag.Wait wait)
             {
                 AppDebugLog.Write($"Action step {i + 1}/{actions.Count}: waiting {wait.Milliseconds}ms");
@@ -1024,36 +1129,33 @@ public sealed class CompanionManager : IDisposable
             string label = StepLabel(action, i + 1, actions.Count);
             AppDebugLog.Write($"Action step {i + 1}/{actions.Count}: {label}");
 
-            // Show toast and wait for it to complete before executing
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             WpfApp.Current.Dispatcher.Invoke(() =>
                 _overlayManager.ShowActionToast(label, AppConstants.ActionToastHoldMs, () => tcs.TrySetResult(true)));
             await tcs.Task.WaitAsync(ct);
             ct.ThrowIfCancellationRequested();
 
-            // Execute the step
             ExecuteStep(action, captures);
 
-            // If there are more non-WAIT steps coming, pause and re-screenshot
-            // so the next click targets the fresh page state
             bool moreActionsAhead = actions.Skip(i + 1).Any(a => a is not ActionTag.Wait);
             if (moreActionsAhead)
             {
                 int pauseMs = AppConstants.ActionStepPauseMs;
 
-                // Look ahead: if next tag is an explicit WAIT, use its value instead
                 if (i + 1 < actions.Count && actions[i + 1] is ActionTag.Wait nextWait)
                 {
                     pauseMs = nextWait.Milliseconds;
-                    i++; // skip the WAIT tag in the loop
+                    i++;
                 }
 
                 AppDebugLog.Write($"Action step {i + 1}/{actions.Count}: pausing {pauseMs}ms then re-screenshotting");
                 await Task.Delay(pauseMs, ct);
                 captures = await Task.Run(ScreenCaptureService.CaptureAllScreens, ct);
-                AppDebugLog.Write($"Action step: fresh screenshot captured after pause");
+                AppDebugLog.Write("Action step: fresh screenshot captured after pause");
             }
         }
+
+        return captures;
     }
 
     private static string StepLabel(ActionTag action, int step, int total)
@@ -1067,6 +1169,14 @@ public sealed class CompanionManager : IDisposable
             _                  => $"executing...{suffix}"
         };
     }
+
+    private static string StepDescription(ActionTag action) => action switch
+    {
+        ActionTag.Click c  => c.RightClick ? $"right-clicked ({c.X},{c.Y})" : $"clicked ({c.X},{c.Y})",
+        ActionTag.Type  t  => $"typed \"{t.Text.Truncate(20)}\"",
+        ActionTag.Open  o  => $"opened {o.AppName}",
+        _                  => "executed"
+    };
 
     private static void ExecuteStep(ActionTag action, List<ScreenCaptureData> captures)
     {
@@ -1348,26 +1458,44 @@ public sealed class CompanionManager : IDisposable
         if pointing wouldn't help, append [POINT:none].
 
         performing actions:
-        you can do things on screen — click buttons, type text, open applications, or chain multiple steps. only use actions when the user explicitly asks you to do something. never act without being asked.
+        you can do things on screen — click buttons, type text, open applications, or run multi-step tasks. only use actions when the user explicitly asks you to do something. never act without being asked.
 
         available action tags (append after your spoken text):
         - [CLICK:x,y] — left-click at screenshot pixel coordinates x,y
         - [CLICK:x,y:right] — right-click at x,y
         - [TYPE:the text to type] — type text into the focused window
         - [OPEN:app name] — launch an application (e.g. notepad, chrome, brave)
-        - [WAIT:ms] — pause for ms milliseconds before the next step (use when a page or app needs time to load)
+        - [WAIT:ms] — pause for ms milliseconds before the next step
+        - [DONE] — signal that the full multi-step task is now complete (use this ONLY for multi-step tasks to end the automatic loop)
 
-        multi-step tasks: if the user asks you to do several things in sequence (e.g. "open npm, go to packages, click the package"), append ALL action tags in order in a single response, separated by spaces. clicky will execute them one after the other, taking a fresh screenshot between each step so your coordinates are accurate.
+        for multi-step tasks: only plan what you can see RIGHT NOW in the current screenshot. append the first 1-3 actions that get the ball rolling. after those execute, you'll automatically be shown the new screen state and asked what to do next. do NOT try to plan coordinates for screens you haven't seen yet — wait until you can see them.
 
-        example — "open brave and go to the settings tab":
-        "sure, opening brave and navigating to settings. [OPEN:brave] [WAIT:1500] [CLICK:600,42]"
+        when the full task is complete (no more steps left), end your final response with [DONE].
 
-        example — "click submit and then close the tab":
-        "clicking submit then closing the tab. [CLICK:342,600] [WAIT:800] [CLICK:430,15]"
-
-        CRITICAL: always write spoken text first — never start with a tag. coordinates must come from the current screenshot. when estimating click targets, look at the screenshot carefully and pick the center of the element.
+        CRITICAL: always write spoken text first — never start with a tag. coordinates must come from what you actually see in the screenshot. pick the center of the element you're targeting.
 
         you can also combine with a POINT tag: spoken text → action tags → [POINT:x,y:label] at the very end.
+        """;
+
+    private const string AgentStepSystemPrompt = """
+        you are clicky's action agent — you're mid-way through executing a multi-step task the user requested. you can see the current screen state. your job is to determine the single next action.
+
+        rules:
+        - look at the screenshot carefully. identify exactly what element needs to be interacted with.
+        - give ONE short spoken sentence describing what you're doing (written for TTS — casual, lowercase).
+        - append ONE action tag for the next step.
+        - if the full task is now complete with no more steps needed, say so in one sentence and end with [DONE] — no action tags.
+        - use screenshot pixel coordinates for CLICK. the coordinate space origin (0,0) is top-left of the screenshot image.
+        - never plan ahead for screens you haven't seen. only act on what's visible right now.
+        - do not ask questions. just act or signal done.
+
+        available action tags:
+        - [CLICK:x,y] — left-click at screenshot pixel coordinates x,y
+        - [CLICK:x,y:right] — right-click
+        - [TYPE:text] — type into focused window
+        - [OPEN:app] — launch application
+        - [WAIT:ms] — pause ms milliseconds
+        - [DONE] — task complete, stop
         """;
 
 

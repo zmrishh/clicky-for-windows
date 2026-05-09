@@ -51,6 +51,8 @@ internal static class AppConstants
     public const int ActionStepPauseMs = 1200;
     /// <summary>Toast display duration before each action fires.</summary>
     public const int ActionToastHoldMs = 1200;
+    /// <summary>Maximum agentic loop iterations to prevent runaway loops.</summary>
+    public const int AgentMaxIterations = 8;
 
     // Persistence
     public const string SettingsFileName = "settings.json";
