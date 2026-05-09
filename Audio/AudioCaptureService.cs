@@ -6,18 +6,12 @@ using ClickyWindows.Core;
 namespace ClickyWindows.Audio;
 
 /// <summary>
-/// Captures microphone audio and resamples to 16 kHz / mono / PCM-16LE for AssemblyAI.
+/// Captures microphone audio and converts it to 16 kHz / mono / PCM-16LE for AssemblyAI.
 ///
-/// Architecture:
-/// - WaveInEvent (WinMM) is the primary capture path. WinMM delivers DataAvailable
-///   callbacks via the Windows message queue of the thread that called waveInOpen.
-///   If that thread exits, all callbacks are silently dropped.
-/// - A dedicated STA thread ("AudioCapturePump") owns the WaveInEvent for its
-///   entire lifetime: it calls StartRecording(), pumps Application.DoEvents() in a
-///   15 ms loop so waveInProc messages are dispatched, then calls StopRecording()
-///   and disposes when signalled by Stop().
-/// - The resampler and BufferedWaveProvider live on the STA thread's locals; only
-///   the AudioDataAvailable event fires callbacks into the rest of the application.
+/// MediaFoundationResampler is a COM object and cannot be used from a thread other than
+/// the one that created it (apartment boundary violation). Instead we do a pure-managed
+/// decimation: average stereo channels to mono, then downsample 44100→16000 via integer
+/// linear interpolation — no COM, no cross-thread issues.
 /// </summary>
 public sealed class AudioCaptureService : IDisposable
 {
@@ -27,11 +21,17 @@ public sealed class AudioCaptureService : IDisposable
     private readonly object _lock = new();
     private volatile bool   _isCapturing;
 
-    // Signals the STA pump thread to stop
     private System.Threading.ManualResetEventSlim? _stopSignal;
 
-    private static readonly WaveFormat TargetFormat =
-        new(AppConstants.AudioSampleRate, AppConstants.AudioBitsPerSample, AppConstants.AudioChannels);
+    // Source format delivered by WaveInEvent (primary path)
+    private const int SrcRate     = 44100;
+    private const int SrcChannels = 2;
+    private const int SrcBits     = 16;
+
+    // Target format expected by AssemblyAI
+    private const int DstRate     = AppConstants.AudioSampleRate;    // 16000
+    private const int DstChannels = AppConstants.AudioChannels;      // 1
+    private const int DstBits     = AppConstants.AudioBitsPerSample; // 16
 
     private const float DecayFactor = 0.72f;
     private const float BoostFactor = 10.2f;
@@ -53,9 +53,7 @@ public sealed class AudioCaptureService : IDisposable
 
             var staThread = new System.Threading.Thread(() =>
             {
-                IWaveIn?                  capture        = null;
-                BufferedWaveProvider?     resamplerInput = null;
-                MediaFoundationResampler? resampler      = null;
+                IWaveIn? capture = null;
 
                 try
                 {
@@ -66,33 +64,36 @@ public sealed class AudioCaptureService : IDisposable
                         return;
                     }
 
-                    resamplerInput = new BufferedWaveProvider(capture.WaveFormat)
-                    {
-                        BufferDuration          = TimeSpan.FromSeconds(5),
-                        DiscardOnBufferOverflow = true
-                    };
-                    resampler = new MediaFoundationResampler(resamplerInput, TargetFormat)
-                    {
-                        ResamplerQuality = 60
-                    };
+                    // Determine conversion parameters based on actual device format
+                    int srcRate     = capture.WaveFormat.SampleRate;
+                    int srcChannels = capture.WaveFormat.Channels;
 
                     capture.DataAvailable += (_, e) =>
                     {
-                        AppDebugLog.Write($"AudioCapture: DataAvailable bytes={e.BytesRecorded} capturing={_isCapturing}");
                         if (e.BytesRecorded == 0) return;
-                        resamplerInput.AddSamples(e.Buffer, 0, e.BytesRecorded);
-                        var resampled = DrainResampler(resampler);
-                        if (resampled.Length == 0) return;
-                        UpdatePowerLevel(resampled);
-                        AudioDataAvailable?.Invoke(resampled);
+                        try
+                        {
+                            var pcm16Mono16k = ConvertToMono16k(
+                                e.Buffer, e.BytesRecorded, srcRate, srcChannels);
+                            if (pcm16Mono16k.Length == 0) return;
+                            UpdatePowerLevel(pcm16Mono16k);
+                            AudioDataAvailable?.Invoke(pcm16Mono16k);
+                        }
+                        catch (Exception ex)
+                        {
+                            AppDebugLog.Write($"AudioCapture: conversion error — {ex.Message}");
+                        }
                     };
 
                     capture.RecordingStopped += (_, e) =>
-                        AppDebugLog.Write($"AudioCapture: RecordingStopped exception={e.Exception?.Message ?? "none"}");
+                    {
+                        if (e?.Exception != null)
+                            AppDebugLog.Write($"AudioCapture: RecordingStopped error — {e.Exception.Message}");
+                    };
 
                     capture.StartRecording();
                     startedOk = true;
-                    AppDebugLog.Write("AudioCapture: StartRecording() — STA pump thread live.");
+                    AppDebugLog.Write($"AudioCapture: recording started ({srcRate}Hz {srcChannels}ch → {DstRate}Hz mono).");
                 }
                 catch (Exception ex)
                 {
@@ -104,12 +105,8 @@ public sealed class AudioCaptureService : IDisposable
 
                 startedSignal.Set();
 
-                // Pump the Win32 message loop on this thread so waveInProc callbacks
-                // (posted as WM_* messages to this thread's queue) are dispatched.
-                // We use a hidden message-only window via PeekMessage to drain the
-                // queue, and wake ourselves every 15 ms to check the stop signal.
-                // Application.DoEvents() does NOT work inside a WPF process because
-                // it pumps the WPF dispatcher queue, not the raw Win32 queue.
+                // Keep this STA thread alive with a Win32 message pump.
+                // waveInProc posts WM_* messages to this thread's queue.
                 NativeMsg msg;
                 while (!stopSignal.IsSet)
                 {
@@ -123,7 +120,7 @@ public sealed class AudioCaptureService : IDisposable
 
                 try { capture!.StopRecording(); } catch { /* ignore */ }
 
-                // Drain any remaining messages after StopRecording
+                // Drain remaining messages
                 while (PeekMessage(out msg, IntPtr.Zero, 0, 0, PM_REMOVE))
                 {
                     TranslateMessage(ref msg);
@@ -131,7 +128,6 @@ public sealed class AudioCaptureService : IDisposable
                 }
 
                 capture!.Dispose();
-                resampler?.Dispose();
                 AppDebugLog.Write("AudioCapture: STA pump thread exiting.");
             });
 
@@ -171,19 +167,9 @@ public sealed class AudioCaptureService : IDisposable
 
     // ── Device selection ──────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Creates the best available capture source.
-    ///
-    /// WaveInEvent (WinMM) is tried first: Realtek WASAPI in shared mode opens
-    /// successfully but never fires DataAvailable on many consumer drivers.
-    ///
-    /// 1. WaveInEvent 44.1 kHz stereo 16-bit — most compatible WinMM format.
-    /// 2. WaveInEvent 16 kHz mono 16-bit     — direct target, no resample needed.
-    /// 3. WASAPI Shared Communications mic   — last resort for non-Realtek hardware.
-    /// </summary>
     private static IWaveIn? CreateCapture()
     {
-        // Attempt 1: WaveInEvent 44.1 kHz stereo 16-bit
+        // Primary: WaveInEvent 44.1 kHz stereo 16-bit (most compatible WinMM format)
         try
         {
             if (WaveIn.DeviceCount > 0)
@@ -197,21 +183,20 @@ public sealed class AudioCaptureService : IDisposable
                     BufferMilliseconds = AppConstants.AudioBufferMilliseconds
                 };
             }
-            AppDebugLog.Write("AudioCapture: WaveIn.DeviceCount=0");
         }
         catch (Exception ex)
         {
-            AppDebugLog.Write($"AudioCapture: WaveInEvent 44.1k failed ({ex.Message}), trying 16k mono");
+            AppDebugLog.Write($"AudioCapture: WaveInEvent 44.1k failed ({ex.Message}), trying 16k");
         }
 
-        // Attempt 2: WaveInEvent 16 kHz mono 16-bit
+        // Fallback: WaveInEvent 16 kHz mono — matches target, no conversion needed
         try
         {
             AppDebugLog.Write("AudioCapture: WaveInEvent 16000/16/1 (fallback)");
             return new WaveInEvent
             {
                 DeviceNumber       = 0,
-                WaveFormat         = TargetFormat,
+                WaveFormat         = new WaveFormat(DstRate, DstBits, DstChannels),
                 BufferMilliseconds = AppConstants.AudioBufferMilliseconds
             };
         }
@@ -220,33 +205,64 @@ public sealed class AudioCaptureService : IDisposable
             AppDebugLog.Write($"AudioCapture: WaveInEvent 16k failed ({ex.Message}), trying WASAPI");
         }
 
-        // Attempt 3: WASAPI on default Communications mic
+        // Last resort: WASAPI shared mode
         try
         {
-            var enumerator = new MMDeviceEnumerator();
-            var mic = enumerator.GetDefaultAudioEndpoint(DataFlow.Capture, Role.Communications);
-            var wasapi = new WasapiCapture(mic, true, AppConstants.AudioBufferMilliseconds);
+            var mic = new MMDeviceEnumerator()
+                .GetDefaultAudioEndpoint(DataFlow.Capture, Role.Communications);
             AppDebugLog.Write($"AudioCapture: WASAPI \"{mic.FriendlyName}\" (last resort)");
-            return wasapi;
+            return new WasapiCapture(mic, true, AppConstants.AudioBufferMilliseconds);
         }
         catch (Exception ex)
         {
-            AppDebugLog.Write($"AudioCapture: WASAPI failed ({ex.Message}) — no mic available");
+            AppDebugLog.Write($"AudioCapture: all capture methods failed — {ex.Message}");
             return null;
         }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Pure-managed sample-rate conversion ───────────────────────────────────
 
-    private static byte[] DrainResampler(MediaFoundationResampler resampler)
+    /// <summary>
+    /// Converts raw PCM from the capture device to 16 kHz mono PCM-16LE.
+    /// Handles stereo→mono mixing and arbitrary sample-rate decimation using
+    /// nearest-neighbour selection (sufficient quality for speech recognition).
+    /// No COM, no external dependencies — safe to call from any thread.
+    /// </summary>
+    private static byte[] ConvertToMono16k(
+        byte[] src, int srcBytes, int srcRate, int srcChannels)
     {
-        var buf = new byte[8192];
-        using var ms = new System.IO.MemoryStream();
-        int read;
-        while ((read = resampler.Read(buf, 0, buf.Length)) > 0)
-            ms.Write(buf, 0, read);
-        return ms.ToArray();
+        int bytesPerSample = 2; // always 16-bit from WaveInEvent
+        int srcFrames      = srcBytes / (bytesPerSample * srcChannels);
+        int dstFrames      = (int)Math.Round((double)srcFrames * DstRate / srcRate);
+
+        if (dstFrames == 0) return [];
+
+        var dst = new byte[dstFrames * 2];
+
+        for (int dstIdx = 0; dstIdx < dstFrames; dstIdx++)
+        {
+            // Map destination frame index back to nearest source frame
+            int srcIdx = (int)((double)dstIdx * srcRate / DstRate);
+            if (srcIdx >= srcFrames) srcIdx = srcFrames - 1;
+
+            // Mix all channels to mono
+            long sum = 0;
+            for (int ch = 0; ch < srcChannels; ch++)
+            {
+                int offset = (srcIdx * srcChannels + ch) * bytesPerSample;
+                short sample = (short)(src[offset] | (src[offset + 1] << 8));
+                sum += sample;
+            }
+            short mono = (short)Math.Clamp(sum / srcChannels, short.MinValue, short.MaxValue);
+
+            dst[dstIdx * 2]     = (byte)(mono & 0xFF);
+            dst[dstIdx * 2 + 1] = (byte)((mono >> 8) & 0xFF);
+        }
+
+        return dst;
     }
+
+    // ── Power level ───────────────────────────────────────────────────────────
 
     private void UpdatePowerLevel(byte[] pcm16)
     {
@@ -256,8 +272,7 @@ public sealed class AudioCaptureService : IDisposable
         for (int i = 0; i < n; i++)
         {
             short s = (short)(pcm16[i * 2] | (pcm16[i * 2 + 1] << 8));
-            double v = s / 32768.0;
-            sum += v * v;
+            sum += (s / 32768.0) * (s / 32768.0);
         }
         float rms     = (float)Math.Sqrt(sum / n);
         float boosted = Math.Min(rms * BoostFactor, 1.0f);

@@ -2,75 +2,65 @@ using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 using NAudio.Wave;
+using Windows.Media.SpeechSynthesis;
+using Windows.Storage.Streams;
 using ClickyWindows.Core;
 
 namespace ClickyWindows.Api;
 
 /// <summary>
-/// Sends text to ElevenLabs via the Worker proxy and plays back the returned MP3
-/// through the default audio output. Mirrors the Swift ElevenLabsTTSClient.
+/// TTS client with two-tier strategy:
+///   1. ElevenLabs via Worker proxy — high-quality neural voice (requires paid credits).
+///   2. Windows.Media.SpeechSynthesis — free, built-in neural voices (Windows 10+),
+///      used automatically when ElevenLabs is unavailable or returns an error.
 ///
-/// Playback is non-blocking: <see cref="SpeakAsync"/> returns once the audio starts
-/// playing (same behaviour as the Swift implementation where AVAudioPlayer.play()
-/// returns immediately).
+/// Playback is non-blocking: SpeakAsync returns as soon as audio starts playing.
 /// </summary>
 public sealed class ElevenLabsTtsClient : IDisposable
 {
-    private readonly Uri _proxyUri;
+    private readonly Uri        _proxyUri;
     private readonly HttpClient _http;
-    private WaveOutEvent? _waveOut;
-    private readonly object _playbackLock = new();
+
+    private WaveOutEvent?       _waveOut;
+    private readonly object     _playbackLock = new();
+
+    // Windows WinRT synthesizer — created lazily, reused across calls
+    private SpeechSynthesizer?  _winSynth;
+    private readonly object     _synthLock = new();
 
     public ElevenLabsTtsClient(string workerBaseUrl)
     {
         _proxyUri = new Uri(workerBaseUrl.TrimEnd('/') + "/tts");
-        _http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+        _http     = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Fetches TTS audio and begins playback. Returns as soon as playback starts.
-    /// Throws on network/decode errors. Respects <paramref name="cancellationToken"/>.
-    /// </summary>
     public async Task SpeakAsync(string text, CancellationToken cancellationToken = default)
     {
-        var body = BuildRequestBody(text);
-        var json = JsonSerializer.Serialize(body);
-        using var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-        using var request = new HttpRequestMessage(HttpMethod.Post, _proxyUri) { Content = content };
-        request.Headers.Accept.ParseAdd("audio/mpeg");
-
-        using var response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
-
-        if (!response.IsSuccessStatusCode)
+        // Try ElevenLabs first; fall through to Windows TTS on any failure
+        try
         {
-            var err = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-            throw new HttpRequestException(
-                $"ElevenLabs TTS error ({(int)response.StatusCode}): {err}",
-                null,
-                response.StatusCode);
+            await SpeakElevenLabsAsync(text, cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        catch (OperationCanceledException)
+        {
+            throw; // don't swallow cancellation
+        }
+        catch (Exception ex)
+        {
+            AppDebugLog.Write($"TTS: ElevenLabs failed ({ex.Message}) — using Windows TTS.");
         }
 
-        var audioBytes = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
-        cancellationToken.ThrowIfCancellationRequested();
-
-        Console.WriteLine($"[TTS] Playing {audioBytes.Length / 1024}KB audio");
-        PlayMp3(audioBytes);
+        await SpeakWindowsAsync(text, cancellationToken).ConfigureAwait(false);
     }
 
-    /// <summary>Whether TTS audio is currently playing.</summary>
     public bool IsPlaying
     {
-        get
-        {
-            lock (_playbackLock)
-                return _waveOut?.PlaybackState == PlaybackState.Playing;
-        }
+        get { lock (_playbackLock) return _waveOut?.PlaybackState == PlaybackState.Playing; }
     }
 
-    /// <summary>Stops any in-progress playback immediately.</summary>
     public void StopPlayback()
     {
         lock (_playbackLock)
@@ -81,56 +71,108 @@ public sealed class ElevenLabsTtsClient : IDisposable
         }
     }
 
-    // ── Fallback ──────────────────────────────────────────────────────────────
+    // ── ElevenLabs path ───────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Speaks a message using Windows built-in TTS via the Windows.Speech COM API.
-    /// Used as a fallback when ElevenLabs credits are exhausted.
-    /// </summary>
-    public static void SpeakFallback(string message)
+    private async Task SpeakElevenLabsAsync(string text, CancellationToken ct)
     {
-        Task.Run(() =>
+        var json    = JsonSerializer.Serialize(BuildElevenLabsBody(text));
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        using var request = new HttpRequestMessage(HttpMethod.Post, _proxyUri) { Content = content };
+        request.Headers.Accept.ParseAdd("audio/mpeg");
+
+        using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
+
+        if (!response.IsSuccessStatusCode)
         {
-            try
-            {
-                // Use Windows SAPI via PowerShell as a lightweight fallback;
-                // avoids a hard dependency on System.Speech in .NET 10.
-                using var ps = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "powershell.exe",
-                    Arguments = $"-NoProfile -Command \"Add-Type -AssemblyName System.Speech; " +
-                                $"$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; " +
-                                $"$s.Speak([System.Text.RegularExpressions.Regex]::Replace('{message.Replace("'", " ")}', '[^a-zA-Z0-9 .,!?]', ''))\"",
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                });
-                ps?.WaitForExit(8000);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[TTS] Fallback speech failed: {ex.Message}");
-            }
-        });
+            var err = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new HttpRequestException(
+                $"ElevenLabs {(int)response.StatusCode}: {err}", null, response.StatusCode);
+        }
+
+        var audioBytes = await response.Content.ReadAsByteArrayAsync(ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+
+        AppDebugLog.Write($"TTS: ElevenLabs playing {audioBytes.Length / 1024}KB");
+        PlayMp3(audioBytes);
     }
 
-    // ── Private ───────────────────────────────────────────────────────────────
+    // ── Windows TTS path ──────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Synthesises text using the best available Windows neural voice and plays
+    /// it through NAudio so volume/device is consistent with the rest of the app.
+    /// </summary>
+    private async Task SpeakWindowsAsync(string text, CancellationToken ct)
+    {
+        SpeechSynthesizer synth;
+        lock (_synthLock)
+        {
+            _winSynth ??= new SpeechSynthesizer();
+
+            // Prefer the highest-quality installed voice
+            var voices = SpeechSynthesizer.AllVoices;
+            var preferred = voices
+                .OrderByDescending(v => v.DisplayName.Contains("Neural",  StringComparison.OrdinalIgnoreCase) ? 2
+                                      : v.DisplayName.Contains("Natural", StringComparison.OrdinalIgnoreCase) ? 1
+                                      : 0)
+                .ThenByDescending(v => v.Language.StartsWith("en", StringComparison.OrdinalIgnoreCase))
+                .FirstOrDefault();
+
+            if (preferred != null && _winSynth.Voice?.Id != preferred.Id)
+            {
+                _winSynth.Voice = preferred;
+                AppDebugLog.Write($"TTS: Windows voice = \"{preferred.DisplayName}\"");
+            }
+
+            synth = _winSynth;
+        }
+
+        ct.ThrowIfCancellationRequested();
+
+        // SynthesizeTextToStreamAsync returns a WAV-format IRandomAccessStream
+        var winStream = await synth.SynthesizeTextToStreamAsync(text).AsTask(ct).ConfigureAwait(false);
+        ct.ThrowIfCancellationRequested();
+
+        // Read WinRT stream via DataReader — no extension method dependencies
+        var ms         = new System.IO.MemoryStream();
+        var dataReader = new DataReader(winStream.GetInputStreamAt(0));
+        uint remaining = (uint)winStream.Size;
+        while (remaining > 0)
+        {
+            uint chunk = Math.Min(remaining, 65536u);
+            await dataReader.LoadAsync(chunk).AsTask(ct).ConfigureAwait(false);
+            var buf = new byte[chunk];
+            dataReader.ReadBytes(buf);
+            ms.Write(buf, 0, (int)chunk);
+            remaining -= chunk;
+        }
+        dataReader.Dispose();
+
+        ms.Position = 0;
+        AppDebugLog.Write($"TTS: Windows TTS {ms.Length / 1024}KB");
+
+        var reader  = new WaveFileReader(ms);
+        StartWaveOut(reader, () => { reader.Dispose(); ms.Dispose(); });
+    }
+
+    // ── Playback helpers ──────────────────────────────────────────────────────
 
     private void PlayMp3(byte[] audioBytes)
     {
         StopPlayback();
-
-        // NAudio reads MP3 from a IoMemoryStream; keep the stream alive for the
-        // duration of playback by storing it in a local that the PlaybackStopped
-        // callback will dispose.
-        var ms = new IoMemoryStream(audioBytes);
+        var ms     = new IoMemoryStream(audioBytes);
         var reader = new Mp3FileReader(ms);
-        var waveOut = new WaveOutEvent();
+        StartWaveOut(reader, () => { reader.Dispose(); ms.Dispose(); });
+    }
+
+    private void StartWaveOut(IWaveProvider provider, Action onStopped)
+    {
+        var waveOut = new WaveOutEvent { Volume = 1.0f };
 
         waveOut.PlaybackStopped += (_, _) =>
         {
+            onStopped();
             waveOut.Dispose();
-            reader.Dispose();
-            ms.Dispose();
             lock (_playbackLock)
             {
                 if (ReferenceEquals(_waveOut, waveOut))
@@ -138,23 +180,62 @@ public sealed class ElevenLabsTtsClient : IDisposable
             }
         };
 
-        waveOut.Init(reader);
+        waveOut.Init(provider);
 
         lock (_playbackLock)
-        {
             _waveOut = waveOut;
-        }
 
         waveOut.Play();
     }
 
-    private static Dictionary<string, object> BuildRequestBody(string text) => new()
+    // ── Legacy static fallback (kept for error-message paths) ─────────────────
+
+    public static void SpeakFallback(string message)
     {
-        ["text"] = text,
-        ["model_id"] = AppConstants.TtsModelId,
+        Task.Run(async () =>
+        {
+            try
+            {
+                using var synth  = new SpeechSynthesizer();
+                var winStream    = await synth.SynthesizeTextToStreamAsync(message);
+                var ms           = new System.IO.MemoryStream();
+                var dr           = new DataReader(winStream.GetInputStreamAt(0));
+                uint rem         = (uint)winStream.Size;
+                while (rem > 0)
+                {
+                    uint chunk = Math.Min(rem, 65536u);
+                    await dr.LoadAsync(chunk);
+                    var buf = new byte[chunk];
+                    dr.ReadBytes(buf);
+                    ms.Write(buf, 0, (int)chunk);
+                    rem -= chunk;
+                }
+                dr.Dispose();
+                ms.Position = 0;
+
+                using var reader = new WaveFileReader(ms);
+                using var wo     = new WaveOutEvent { Volume = 1.0f };
+                wo.Init(reader);
+                wo.Play();
+                while (wo.PlaybackState == PlaybackState.Playing)
+                    await Task.Delay(100);
+            }
+            catch (Exception ex)
+            {
+                AppDebugLog.Write($"TTS: SpeakFallback failed — {ex.Message}");
+            }
+        });
+    }
+
+    // ── Private helpers ───────────────────────────────────────────────────────
+
+    private static Dictionary<string, object> BuildElevenLabsBody(string text) => new()
+    {
+        ["text"]          = text,
+        ["model_id"]      = AppConstants.TtsModelId,
         ["voice_settings"] = new Dictionary<string, object>
         {
-            ["stability"] = AppConstants.TtsStability,
+            ["stability"]        = AppConstants.TtsStability,
             ["similarity_boost"] = AppConstants.TtsSimilarityBoost
         }
     };
@@ -165,6 +246,6 @@ public sealed class ElevenLabsTtsClient : IDisposable
     {
         StopPlayback();
         _http.Dispose();
+        lock (_synthLock) { _winSynth?.Dispose(); _winSynth = null; }
     }
 }
-
