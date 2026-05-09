@@ -1078,6 +1078,7 @@ public sealed class CompanionManager : IDisposable
             ActionTag.DoubleClick _  => "opening that.",
             ActionTag.Type       _  => "typing that for you.",
             ActionTag.Open       o  => $"opening {o.AppName}.",
+            ActionTag.Navigate   _  => "navigating there.",
             ActionTag.KeyPress   k  => $"pressing {k.Combo}.",
             null                    => "done.",
             _                       => "on it."
@@ -1173,6 +1174,7 @@ public sealed class CompanionManager : IDisposable
             ActionTag.DoubleClick _  => $"opening...{suffix}",
             ActionTag.Type       t  => $"typing: {t.Text.Truncate(28)}{suffix}",
             ActionTag.Open       o  => $"opening {o.AppName}...{suffix}",
+            ActionTag.Navigate   n  => $"navigating to {n.Url.Truncate(30)}...{suffix}",
             ActionTag.KeyPress   k  => $"pressing {k.Combo}{suffix}",
             _                       => $"executing...{suffix}"
         };
@@ -1184,6 +1186,7 @@ public sealed class CompanionManager : IDisposable
         ActionTag.DoubleClick d => $"double-clicked ({d.X},{d.Y})",
         ActionTag.Type       t  => $"typed \"{t.Text.Truncate(20)}\"",
         ActionTag.Open       o  => $"opened {o.AppName}",
+        ActionTag.Navigate   n  => $"navigated to {n.Url.Truncate(40)}",
         ActionTag.KeyPress   k  => $"pressed {k.Combo}",
         _                       => "executed"
     };
@@ -1223,6 +1226,10 @@ public sealed class CompanionManager : IDisposable
 
             case ActionTag.Open open:
                 ActionExecutor.OpenApp(open.AppName);
+                break;
+
+            case ActionTag.Navigate nav:
+                ActionExecutor.Navigate(nav.Url);
                 break;
 
             case ActionTag.KeyPress key:
@@ -1492,6 +1499,7 @@ public sealed class CompanionManager : IDisposable
         - [DBLCLICK:x,y] — double-click (use this to OPEN files, folders, apps — never single-click to open)
         - [TYPE:the text to type] — type text into the focused window
         - [OPEN:app name] — launch an application by name (e.g. notepad, chrome, brave, explorer)
+        - [NAVIGATE:https://url] — navigate the CURRENT browser tab to a URL (uses Ctrl+L → type URL → Enter). use this instead of opening a new tab.
         - [KEYPRESS:combo] — press a key combo, e.g. Win+Down (minimize), Win+Up (maximize), Alt+F4 (close), Ctrl+W (close tab), Ctrl+T (new tab), Win+D (show desktop), Enter (confirm/send)
         - [WAIT:ms] — pause for ms milliseconds before the next step
         - [DONE] — signal that the full multi-step task is now complete
@@ -1514,6 +1522,21 @@ public sealed class CompanionManager : IDisposable
         - always: [CLICK on the text input box] → [TYPE:composed message] → [KEYPRESS:Enter]
         - the [KEYPRESS:Enter] at the end sends the message. never skip it.
         - if you need to find the right contact first, click/search for them before typing.
+
+        IMPORTANT for browser navigation:
+        - NEVER open a new tab to navigate somewhere. use [NAVIGATE:url] to go to a URL in the current tab.
+        - if a browser isn't open yet, use [OPEN:brave] (or chrome/edge) first, then [WAIT:800], then [NAVIGATE:url].
+        - [KEYPRESS:Ctrl+T] and [KEYPRESS:Ctrl+L] are only for explicitly tab/address-bar tasks — never use them just to navigate.
+
+        IMPORTANT for WhatsApp Web (https://web.whatsapp.com):
+        step-by-step workflow:
+        1. if WhatsApp Web isn't open: [OPEN:brave] → [WAIT:1000] → [NAVIGATE:https://web.whatsapp.com] → [WAIT:3000]
+        2. if WhatsApp Web is already open: [NAVIGATE:https://web.whatsapp.com] → [WAIT:2000]
+        3. click the search box at the top of the left panel → [TYPE:contact name]
+        4. [WAIT:1000] → click the correct chat from the results
+        5. click the message input bar at the bottom → [TYPE:composed message] → [KEYPRESS:Enter]
+        - compose a proper, natural-sounding message — not the user's raw words.
+        - always end with [KEYPRESS:Enter] to send. never skip it.
 
         for multi-step tasks: only plan what you can see RIGHT NOW in the current screenshot. append the first 1-3 actions that get the ball rolling. after those execute, you'll automatically be shown the new screen state and asked what to do next. do NOT try to plan coordinates for screens you haven't seen yet.
 
@@ -1542,6 +1565,7 @@ public sealed class CompanionManager : IDisposable
         - [DBLCLICK:x,y] — double-click — USE THIS to open folders, files, and apps in File Explorer or desktop. a single CLICK only selects, it does NOT open.
         - [TYPE:text] — type into focused window
         - [OPEN:app] — launch application by name
+        - [NAVIGATE:https://url] — navigate current browser tab to a URL (Ctrl+L → type → Enter). NEVER open new tabs just to navigate.
         - [KEYPRESS:combo] — keyboard shortcut (e.g. Win+Down=minimize, Win+Up=maximize, Alt+F4=close window, Ctrl+W=close tab, Enter=confirm/send)
         - [WAIT:ms] — pause ms milliseconds
         - [DONE] — task complete, stop
@@ -1550,6 +1574,10 @@ public sealed class CompanionManager : IDisposable
         - if the task involves sending a message, compose a complete, natural, well-written version — don't just type the user's raw words.
         - always click the text input box first, then [TYPE:composed message], then [KEYPRESS:Enter] to send.
         - the [KEYPRESS:Enter] step is mandatory — it sends the message. never end a messaging task without it.
+
+        IMPORTANT for browser navigation:
+        - use [NAVIGATE:url] to go somewhere in the current tab. NEVER use [KEYPRESS:Ctrl+T] just to navigate.
+        - WhatsApp Web workflow: search box (click it → TYPE contact name → WAIT → click result) → message bar (click it → TYPE message → KEYPRESS:Enter).
         """;
 
 

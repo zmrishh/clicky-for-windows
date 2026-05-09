@@ -62,6 +62,12 @@ public abstract class ActionTag
         public string Combo { get; init; } = "";
     }
 
+    /// <summary>Navigate the active browser tab to a URL (Ctrl+L → type → Enter).</summary>
+    public sealed class Navigate : ActionTag
+    {
+        public string Url { get; init; } = "";
+    }
+
     /// <summary>Pause for <see cref="Milliseconds"/> before the next step.</summary>
     public sealed class Wait : ActionTag
     {
@@ -85,7 +91,9 @@ public static class ActionTagParser
             @"|" +
             @"(WAIT)\s*:\s*(\d+)" +                                      // 14-15: WAIT
             @"|" +
-            @"(DONE)" +                                                   // 16: DONE
+            @"(NAVIGATE)\s*:\s*([^\]]+)" +                               // 16-17: NAVIGATE
+            @"|" +
+            @"(DONE)" +                                                   // 18: DONE
         @")\]",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
@@ -133,7 +141,11 @@ public static class ActionTagParser
                 if (int.TryParse(match.Groups[15].Value, out int ms))
                     actions.Add(new ActionTag.Wait { Milliseconds = Math.Clamp(ms, 0, 30_000) });
             }
-            else if (match.Groups[16].Success) // DONE
+            else if (match.Groups[16].Success) // NAVIGATE
+            {
+                actions.Add(new ActionTag.Navigate { Url = match.Groups[17].Value.Trim() });
+            }
+            else if (match.Groups[18].Success) // DONE
             {
                 isDone = true;
             }

@@ -215,6 +215,21 @@ public static class ActionExecutor
     }
 
     /// <summary>
+    /// Navigates the currently active browser tab to the given URL.
+    /// Uses Ctrl+L to focus the address bar (works in Chrome, Edge, Brave, Firefox),
+    /// then types the URL and presses Enter.
+    /// </summary>
+    public static void Navigate(string url)
+    {
+        PressKey("Ctrl+L");
+        Thread.Sleep(180); // let the address bar gain focus and select existing text
+        Type(url);
+        Thread.Sleep(60);
+        PressKey("Enter");
+        AppDebugLog.Write($"ActionExecutor: navigate to \"{url}\"");
+    }
+
+    /// <summary>
     /// Launches an application by name or path using the shell.
     /// Spoken names (e.g. "apple music", "file explorer") are resolved to
     /// their real executable or URI-scheme before launching.
@@ -258,7 +273,8 @@ public static class ActionExecutor
         ["media player"]        = "wmplayer",
         ["windows media player"]= "wmplayer",
         // ── Messaging / social ───────────────────────────────────────────────
-        ["whatsapp"]            = "whatsapp:",
+        ["whatsapp"]            = "https://web.whatsapp.com",
+        ["whatsapp web"]        = "https://web.whatsapp.com",
         ["telegram"]            = "telegram:",
         ["discord"]             = "discord",
         ["slack"]               = "slack",
