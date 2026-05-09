@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -259,8 +260,10 @@ public static class ActionExecutor
     // ── App name resolution ───────────────────────────────────────────────────
 
     /// <summary>
-    /// Maps spoken / informal app names to the real executable name or URI
-    /// scheme that Windows can launch via UseShellExecute.
+    /// Maps spoken / informal app names to the real executable name or URI scheme.
+    /// For apps that have both a desktop version and a web fallback, the entry
+    /// here is the web URL — <see cref="ResolveAppName"/> checks for the installed
+    /// desktop exe first and overrides this if found.
     /// </summary>
     private static readonly Dictionary<string, string> AppAliases =
         new(StringComparer.OrdinalIgnoreCase)
@@ -268,19 +271,19 @@ public static class ActionExecutor
         // ── Music / media ────────────────────────────────────────────────────
         ["apple music"]         = "ms-music:",
         ["music"]               = "ms-music:",
-        ["spotify"]             = "spotify:",
+        ["spotify"]             = "https://open.spotify.com",   // web fallback
         ["vlc"]                 = "vlc",
         ["media player"]        = "wmplayer",
         ["windows media player"]= "wmplayer",
-        // ── Messaging / social ───────────────────────────────────────────────
+        // ── Messaging / social (web fallbacks — desktop exes checked at runtime) ─
         ["whatsapp"]            = "https://web.whatsapp.com",
         ["whatsapp web"]        = "https://web.whatsapp.com",
-        ["telegram"]            = "telegram:",
-        ["discord"]             = "discord",
-        ["slack"]               = "slack",
+        ["telegram"]            = "https://web.telegram.org",
+        ["discord"]             = "https://discord.com/app",
+        ["slack"]               = "https://app.slack.com",
         ["teams"]               = "msteams:",
         ["microsoft teams"]     = "msteams:",
-        ["zoom"]                = "zoom",
+        ["zoom"]                = "https://app.zoom.us/wc",
         ["skype"]               = "skype:",
         // ── Browsers ─────────────────────────────────────────────────────────
         ["chrome"]              = "chrome",
@@ -328,22 +331,119 @@ public static class ActionExecutor
     };
 
     /// <summary>
+    /// For apps that ship a desktop client but also have a web fallback, these
+    /// candidate exe paths are checked (in order) at runtime. The first existing
+    /// path wins; otherwise the <see cref="AppAliases"/> web-fallback is used.
+    ///
+    /// Paths may contain environment-variable tokens (%LOCALAPPDATA%, etc.).
+    /// </summary>
+    private static readonly Dictionary<string, string[]> DesktopExeCandidates =
+        new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["whatsapp"] =
+        [
+            @"%LOCALAPPDATA%\WhatsApp\WhatsApp.exe",
+            @"%APPDATA%\WhatsApp\WhatsApp.exe",
+        ],
+        ["whatsapp web"] =
+        [
+            @"%LOCALAPPDATA%\WhatsApp\WhatsApp.exe",
+        ],
+        ["spotify"] =
+        [
+            @"%APPDATA%\Spotify\Spotify.exe",
+            @"%LOCALAPPDATA%\Microsoft\WindowsApps\Spotify.exe",
+        ],
+        ["telegram"] =
+        [
+            @"%APPDATA%\Telegram Desktop\Telegram.exe",
+            @"%LOCALAPPDATA%\Telegram Desktop\Telegram.exe",
+        ],
+        ["discord"] =
+        [
+            @"%LOCALAPPDATA%\Discord\Update.exe",          // Discord updater doubles as launcher
+            @"%LOCALAPPDATA%\Discord\app-*\Discord.exe",   // glob, handled below
+        ],
+        ["slack"] =
+        [
+            @"%LOCALAPPDATA%\slack\slack.exe",
+        ],
+        ["zoom"] =
+        [
+            @"%APPDATA%\Zoom\bin\Zoom.exe",
+            @"%LOCALAPPDATA%\Zoom\bin\Zoom.exe",
+        ],
+    };
+
+    /// <summary>
     /// Strips filler words ("open X", "launch X") then looks up the alias table.
-    /// Falls back to the raw name so shell-execute can still try its luck.
+    /// For apps in <see cref="DesktopExeCandidates"/>, checks whether the desktop
+    /// client is installed and prefers it over the web fallback.
     /// </summary>
     private static string ResolveAppName(string name)
     {
-        if (AppAliases.TryGetValue(name, out var hit)) return hit;
+        // Try exact alias first (may be overridden below for installed-app check)
+        AppAliases.TryGetValue(name, out var aliasTarget);
 
         // Strip leading verb: "open brave" → "brave"
         var stripped = Regex.Replace(
             name, @"^(open|launch|start|run)\s+", string.Empty,
             RegexOptions.IgnoreCase).Trim();
 
-        if (AppAliases.TryGetValue(stripped, out var hit2)) return hit2;
+        if (aliasTarget == null)
+            AppAliases.TryGetValue(stripped, out aliasTarget);
 
-        // Return the stripped name so the shell can try (handles "notepad++", etc.)
+        var lookupKey = aliasTarget != null ? name : stripped;
+
+        // For apps with desktop candidates, prefer the installed exe
+        if (DesktopExeCandidates.TryGetValue(lookupKey,  out var candidates) ||
+            DesktopExeCandidates.TryGetValue(stripped,   out candidates))
+        {
+            var exePath = FindFirstExisting(candidates);
+            if (exePath != null)
+            {
+                AppDebugLog.Write($"ActionExecutor: resolved \"{name}\" to installed exe \"{exePath}\"");
+                return exePath;
+            }
+            // Desktop app not found — fall through to web fallback
+            AppDebugLog.Write($"ActionExecutor: \"{name}\" desktop not found, using web fallback");
+        }
+
+        if (aliasTarget != null) return aliasTarget;
+
+        // Last resort: return the stripped name and let the shell try
         return stripped.Length > 0 ? stripped : name;
+    }
+
+    /// <summary>
+    /// Expands environment variables and returns the first path that exists on disk.
+    /// Handles a trailing wildcard segment (e.g. app-*\Discord.exe) via directory scan.
+    /// </summary>
+    private static string? FindFirstExisting(string[] candidates)
+    {
+        foreach (var raw in candidates)
+        {
+            var expanded = Environment.ExpandEnvironmentVariables(raw);
+
+            // Handle simple glob: one wildcard segment anywhere in the path
+            if (expanded.Contains('*'))
+            {
+                var dir  = Path.GetDirectoryName(expanded)!;
+                var file = Path.GetFileName(expanded);
+                if (Directory.Exists(dir))
+                {
+                    var match = Directory
+                        .EnumerateFiles(dir, file, SearchOption.AllDirectories)
+                        .OrderByDescending(File.GetLastWriteTimeUtc)
+                        .FirstOrDefault();
+                    if (match != null) return match;
+                }
+                continue;
+            }
+
+            if (File.Exists(expanded)) return expanded;
+        }
+        return null;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

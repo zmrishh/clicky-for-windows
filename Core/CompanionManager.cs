@@ -1493,6 +1493,12 @@ public sealed class CompanionManager : IDisposable
         performing actions:
         you can do things on screen — click buttons, type text, open applications, or run multi-step tasks. only use actions when the user explicitly asks you to do something. never act without being asked.
 
+        IMPORTANT — before opening any app:
+        - look at the current screenshot carefully. check the taskbar, desktop, open windows, and system tray.
+        - if the app is already open or visible in the taskbar, click on it to bring it to focus — don't launch a new instance.
+        - if you can see a desktop shortcut or taskbar icon for the app, click it rather than using [OPEN:].
+        - only use [OPEN:app] when the app isn't visible anywhere on screen.
+
         available action tags (append after your spoken text):
         - [CLICK:x,y] — left-click at screenshot pixel coordinates x,y
         - [CLICK:x,y:right] — right-click at x,y
@@ -1558,6 +1564,11 @@ public sealed class CompanionManager : IDisposable
         - use screenshot pixel coordinates for CLICK/DBLCLICK. origin (0,0) is top-left of the screenshot.
         - never plan ahead for screens you haven't seen. only act on what's visible right now.
         - do not ask questions. just act or signal done.
+
+        IMPORTANT — before opening any app:
+        - scan the taskbar, desktop, and open windows in the screenshot first.
+        - if the app is already open or pinned to the taskbar, CLICK on it to bring it to focus — do not use [OPEN:].
+        - only use [OPEN:app] when the app is nowhere to be found on screen.
 
         available action tags:
         - [CLICK:x,y] — left-click (for selecting, activating buttons, etc.)
