@@ -1492,7 +1492,7 @@ public sealed class CompanionManager : IDisposable
         - [DBLCLICK:x,y] — double-click (use this to OPEN files, folders, apps — never single-click to open)
         - [TYPE:the text to type] — type text into the focused window
         - [OPEN:app name] — launch an application by name (e.g. notepad, chrome, brave, explorer)
-        - [KEYPRESS:combo] — press a key combo, e.g. Win+Down (minimize), Win+Up (maximize), Alt+F4 (close), Ctrl+W (close tab), Ctrl+T (new tab), Win+D (show desktop)
+        - [KEYPRESS:combo] — press a key combo, e.g. Win+Down (minimize), Win+Up (maximize), Alt+F4 (close), Ctrl+W (close tab), Ctrl+T (new tab), Win+D (show desktop), Enter (confirm/send)
         - [WAIT:ms] — pause for ms milliseconds before the next step
         - [DONE] — signal that the full multi-step task is now complete
 
@@ -1507,6 +1507,13 @@ public sealed class CompanionManager : IDisposable
         IMPORTANT for file navigation:
         - to OPEN a folder or file in File Explorer → use [DBLCLICK:x,y], NOT [CLICK:x,y]
         - single [CLICK:x,y] only selects/highlights, it does NOT open
+
+        IMPORTANT for typing messages (WhatsApp, Telegram, iMessage, Messenger, email, etc.):
+        - when the user says "send a message saying X" or "message someone saying Y", do NOT type their raw words. instead, compose a complete, natural, well-written message that sounds like the user would actually send. use proper punctuation. match the tone to the context (casual for friends, polite for colleagues).
+        - example: user says "message john saying i cant come tomorrow" → you compose: "Hey John, just wanted to let you know I won't be able to make it tomorrow. Sorry for the inconvenience, I'll catch you another time!" — not just "i cant come tomorrow".
+        - always: [CLICK on the text input box] → [TYPE:composed message] → [KEYPRESS:Enter]
+        - the [KEYPRESS:Enter] at the end sends the message. never skip it.
+        - if you need to find the right contact first, click/search for them before typing.
 
         for multi-step tasks: only plan what you can see RIGHT NOW in the current screenshot. append the first 1-3 actions that get the ball rolling. after those execute, you'll automatically be shown the new screen state and asked what to do next. do NOT try to plan coordinates for screens you haven't seen yet.
 
@@ -1535,9 +1542,14 @@ public sealed class CompanionManager : IDisposable
         - [DBLCLICK:x,y] — double-click — USE THIS to open folders, files, and apps in File Explorer or desktop. a single CLICK only selects, it does NOT open.
         - [TYPE:text] — type into focused window
         - [OPEN:app] — launch application by name
-        - [KEYPRESS:combo] — keyboard shortcut (e.g. Win+Down=minimize, Win+Up=maximize, Alt+F4=close window, Ctrl+W=close tab, Enter=confirm)
+        - [KEYPRESS:combo] — keyboard shortcut (e.g. Win+Down=minimize, Win+Up=maximize, Alt+F4=close window, Ctrl+W=close tab, Enter=confirm/send)
         - [WAIT:ms] — pause ms milliseconds
         - [DONE] — task complete, stop
+
+        IMPORTANT for typing messages (WhatsApp, Telegram, email, chat apps, etc.):
+        - if the task involves sending a message, compose a complete, natural, well-written version — don't just type the user's raw words.
+        - always click the text input box first, then [TYPE:composed message], then [KEYPRESS:Enter] to send.
+        - the [KEYPRESS:Enter] step is mandatory — it sends the message. never end a messaging task without it.
         """;
 
 
