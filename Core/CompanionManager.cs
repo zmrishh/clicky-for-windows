@@ -1018,6 +1018,9 @@ public sealed class CompanionManager : IDisposable
 
             if (current.IsDone) break;
 
+            // Pause so any triggered UI animation settles before we screenshot
+            await Task.Delay(AppConstants.ActionStepPauseMs, ct);
+
             // Re-screenshot and ask Claude what to do next
             AppDebugLog.Write($"Agent loop: iteration {iteration} complete, asking Claude for next step.");
             captures = await Task.Run(ScreenCaptureService.CaptureAllScreens, ct);
@@ -1057,7 +1060,8 @@ public sealed class CompanionManager : IDisposable
 
             if (!string.IsNullOrWhiteSpace(current.SpokenText))
             {
-                // Show + speak the step narrative without cluttering the history
+                // Stop previous agent-step TTS before speaking the next line
+                _ttsClient.StopPlayback();
                 WpfApp.Current.Dispatcher.Invoke(() =>
                     _overlayManager.ShowResponse(current.SpokenText));
                 _ = RunTtsAsync(current.SpokenText, ct);
@@ -1070,11 +1074,13 @@ public sealed class CompanionManager : IDisposable
         if (!string.IsNullOrWhiteSpace(r.SpokenText)) return r.SpokenText;
         return r.Action switch
         {
-            ActionTag.Click c  => c.RightClick ? "right-clicking." : "clicking.",
-            ActionTag.Type  _  => "typing that for you.",
-            ActionTag.Open  o  => $"opening {o.AppName}.",
-            null               => "done.",
-            _                  => "on it."
+            ActionTag.Click      c  => c.RightClick ? "right-clicking." : "clicking.",
+            ActionTag.DoubleClick _  => "opening that.",
+            ActionTag.Type       _  => "typing that for you.",
+            ActionTag.Open       o  => $"opening {o.AppName}.",
+            ActionTag.KeyPress   k  => $"pressing {k.Combo}.",
+            null                    => "done.",
+            _                       => "on it."
         };
     }
 
@@ -1163,19 +1169,23 @@ public sealed class CompanionManager : IDisposable
         string suffix = total > 1 ? $" ({step}/{total})" : "";
         return action switch
         {
-            ActionTag.Click c  => c.RightClick ? $"right-clicking...{suffix}" : $"clicking...{suffix}",
-            ActionTag.Type  t  => $"typing: {t.Text.Truncate(28)}{suffix}",
-            ActionTag.Open  o  => $"opening {o.AppName}...{suffix}",
-            _                  => $"executing...{suffix}"
+            ActionTag.Click      c  => c.RightClick ? $"right-clicking...{suffix}" : $"clicking...{suffix}",
+            ActionTag.DoubleClick _  => $"opening...{suffix}",
+            ActionTag.Type       t  => $"typing: {t.Text.Truncate(28)}{suffix}",
+            ActionTag.Open       o  => $"opening {o.AppName}...{suffix}",
+            ActionTag.KeyPress   k  => $"pressing {k.Combo}{suffix}",
+            _                       => $"executing...{suffix}"
         };
     }
 
     private static string StepDescription(ActionTag action) => action switch
     {
-        ActionTag.Click c  => c.RightClick ? $"right-clicked ({c.X},{c.Y})" : $"clicked ({c.X},{c.Y})",
-        ActionTag.Type  t  => $"typed \"{t.Text.Truncate(20)}\"",
-        ActionTag.Open  o  => $"opened {o.AppName}",
-        _                  => "executed"
+        ActionTag.Click      c  => c.RightClick ? $"right-clicked ({c.X},{c.Y})" : $"clicked ({c.X},{c.Y})",
+        ActionTag.DoubleClick d => $"double-clicked ({d.X},{d.Y})",
+        ActionTag.Type       t  => $"typed \"{t.Text.Truncate(20)}\"",
+        ActionTag.Open       o  => $"opened {o.AppName}",
+        ActionTag.KeyPress   k  => $"pressed {k.Combo}",
+        _                       => "executed"
     };
 
     private static void ExecuteStep(ActionTag action, List<ScreenCaptureData> captures)
@@ -1183,15 +1193,27 @@ public sealed class CompanionManager : IDisposable
         switch (action)
         {
             case ActionTag.Click click:
-                var clickTarget = captures.FirstOrDefault(c => c.IsCursorScreen)
-                                  ?? captures.FirstOrDefault();
-                if (clickTarget != null)
+                var ct1 = captures.FirstOrDefault(c => c.IsCursorScreen) ?? captures.FirstOrDefault();
+                if (ct1 != null)
                 {
-                    double scaleX = clickTarget.PhysicalBounds.Width  / (double)clickTarget.ScreenshotWidthPx;
-                    double scaleY = clickTarget.PhysicalBounds.Height / (double)clickTarget.ScreenshotHeightPx;
-                    int physX = clickTarget.PhysicalBounds.X + (int)(click.X * scaleX);
-                    int physY = clickTarget.PhysicalBounds.Y + (int)(click.Y * scaleY);
-                    ActionExecutor.Click(physX, physY, click.RightClick);
+                    double sx1 = ct1.PhysicalBounds.Width  / (double)ct1.ScreenshotWidthPx;
+                    double sy1 = ct1.PhysicalBounds.Height / (double)ct1.ScreenshotHeightPx;
+                    ActionExecutor.Click(
+                        ct1.PhysicalBounds.X + (int)(click.X * sx1),
+                        ct1.PhysicalBounds.Y + (int)(click.Y * sy1),
+                        click.RightClick);
+                }
+                break;
+
+            case ActionTag.DoubleClick dblClick:
+                var ct2 = captures.FirstOrDefault(c => c.IsCursorScreen) ?? captures.FirstOrDefault();
+                if (ct2 != null)
+                {
+                    double sx2 = ct2.PhysicalBounds.Width  / (double)ct2.ScreenshotWidthPx;
+                    double sy2 = ct2.PhysicalBounds.Height / (double)ct2.ScreenshotHeightPx;
+                    ActionExecutor.DoubleClick(
+                        ct2.PhysicalBounds.X + (int)(dblClick.X * sx2),
+                        ct2.PhysicalBounds.Y + (int)(dblClick.Y * sy2));
                 }
                 break;
 
@@ -1201,6 +1223,10 @@ public sealed class CompanionManager : IDisposable
 
             case ActionTag.Open open:
                 ActionExecutor.OpenApp(open.AppName);
+                break;
+
+            case ActionTag.KeyPress key:
+                ActionExecutor.PressKey(key.Combo);
                 break;
         }
     }
@@ -1463,14 +1489,28 @@ public sealed class CompanionManager : IDisposable
         available action tags (append after your spoken text):
         - [CLICK:x,y] — left-click at screenshot pixel coordinates x,y
         - [CLICK:x,y:right] — right-click at x,y
+        - [DBLCLICK:x,y] — double-click (use this to OPEN files, folders, apps — never single-click to open)
         - [TYPE:the text to type] — type text into the focused window
-        - [OPEN:app name] — launch an application (e.g. notepad, chrome, brave)
+        - [OPEN:app name] — launch an application by name (e.g. notepad, chrome, brave, explorer)
+        - [KEYPRESS:combo] — press a key combo, e.g. Win+Down (minimize), Win+Up (maximize), Alt+F4 (close), Ctrl+W (close tab), Ctrl+T (new tab), Win+D (show desktop)
         - [WAIT:ms] — pause for ms milliseconds before the next step
-        - [DONE] — signal that the full multi-step task is now complete (use this ONLY for multi-step tasks to end the automatic loop)
+        - [DONE] — signal that the full multi-step task is now complete
 
-        for multi-step tasks: only plan what you can see RIGHT NOW in the current screenshot. append the first 1-3 actions that get the ball rolling. after those execute, you'll automatically be shown the new screen state and asked what to do next. do NOT try to plan coordinates for screens you haven't seen yet — wait until you can see them.
+        IMPORTANT window/tab operations:
+        - "minimize" or "minimize window" → [KEYPRESS:Win+Down]
+        - "maximize" or "maximize window" → [KEYPRESS:Win+Up]
+        - "close window" or "close app" → [KEYPRESS:Alt+F4]
+        - "close tab" → [KEYPRESS:Ctrl+W]
+        - "minimize to taskbar" → [KEYPRESS:Win+Down]
+        - NEVER use [CLICK] on a tab's X button to "close" a tab — use [KEYPRESS:Ctrl+W]
 
-        when the full task is complete (no more steps left), end your final response with [DONE].
+        IMPORTANT for file navigation:
+        - to OPEN a folder or file in File Explorer → use [DBLCLICK:x,y], NOT [CLICK:x,y]
+        - single [CLICK:x,y] only selects/highlights, it does NOT open
+
+        for multi-step tasks: only plan what you can see RIGHT NOW in the current screenshot. append the first 1-3 actions that get the ball rolling. after those execute, you'll automatically be shown the new screen state and asked what to do next. do NOT try to plan coordinates for screens you haven't seen yet.
+
+        when the full task is complete, end your final response with [DONE].
 
         CRITICAL: always write spoken text first — never start with a tag. coordinates must come from what you actually see in the screenshot. pick the center of the element you're targeting.
 
@@ -1482,18 +1522,20 @@ public sealed class CompanionManager : IDisposable
 
         rules:
         - look at the screenshot carefully. identify exactly what element needs to be interacted with.
-        - give ONE short spoken sentence describing what you're doing (written for TTS — casual, lowercase).
-        - append ONE action tag for the next step.
+        - give ONE short spoken sentence describing what you're doing (casual, lowercase, written for TTS).
+        - append the appropriate action tag for the next step.
         - if the full task is now complete with no more steps needed, say so in one sentence and end with [DONE] — no action tags.
-        - use screenshot pixel coordinates for CLICK. the coordinate space origin (0,0) is top-left of the screenshot image.
+        - use screenshot pixel coordinates for CLICK/DBLCLICK. origin (0,0) is top-left of the screenshot.
         - never plan ahead for screens you haven't seen. only act on what's visible right now.
         - do not ask questions. just act or signal done.
 
         available action tags:
-        - [CLICK:x,y] — left-click at screenshot pixel coordinates x,y
+        - [CLICK:x,y] — left-click (for selecting, activating buttons, etc.)
         - [CLICK:x,y:right] — right-click
+        - [DBLCLICK:x,y] — double-click — USE THIS to open folders, files, and apps in File Explorer or desktop. a single CLICK only selects, it does NOT open.
         - [TYPE:text] — type into focused window
-        - [OPEN:app] — launch application
+        - [OPEN:app] — launch application by name
+        - [KEYPRESS:combo] — keyboard shortcut (e.g. Win+Down=minimize, Win+Up=maximize, Alt+F4=close window, Ctrl+W=close tab, Enter=confirm)
         - [WAIT:ms] — pause ms milliseconds
         - [DONE] — task complete, stop
         """;

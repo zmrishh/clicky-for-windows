@@ -40,6 +40,12 @@ public abstract class ActionTag
         public bool RightClick { get; init; }
     }
 
+    public sealed class DoubleClick : ActionTag
+    {
+        public int X { get; init; }
+        public int Y { get; init; }
+    }
+
     public sealed class Type : ActionTag
     {
         public string Text { get; init; } = "";
@@ -48,6 +54,12 @@ public abstract class ActionTag
     public sealed class Open : ActionTag
     {
         public string AppName { get; init; } = "";
+    }
+
+    /// <summary>Sends a keyboard shortcut, e.g. "Win+Down", "Alt+F4", "Ctrl+W".</summary>
+    public sealed class KeyPress : ActionTag
+    {
+        public string Combo { get; init; } = "";
     }
 
     /// <summary>Pause for <see cref="Milliseconds"/> before the next step.</summary>
@@ -63,20 +75,20 @@ public static class ActionTagParser
         @"\[(?:" +
             @"(CLICK)\s*:\s*(\d+)\s*,\s*(\d+)(?:\s*:\s*(right))?" +    // 1-4: CLICK
             @"|" +
-            @"(TYPE)\s*:\s*([^\]]+)" +                                   // 5-6: TYPE
+            @"(DBLCLICK)\s*:\s*(\d+)\s*,\s*(\d+)" +                    // 5-7: DBLCLICK
             @"|" +
-            @"(OPEN)\s*:\s*([^\]]+)" +                                   // 7-8: OPEN
+            @"(TYPE)\s*:\s*([^\]]+)" +                                   // 8-9: TYPE
             @"|" +
-            @"(WAIT)\s*:\s*(\d+)" +                                      // 9-10: WAIT
+            @"(OPEN)\s*:\s*([^\]]+)" +                                   // 10-11: OPEN
             @"|" +
-            @"(DONE)" +                                                   // 11: DONE
+            @"(KEYPRESS)\s*:\s*([^\]]+)" +                              // 12-13: KEYPRESS
+            @"|" +
+            @"(WAIT)\s*:\s*(\d+)" +                                      // 14-15: WAIT
+            @"|" +
+            @"(DONE)" +                                                   // 16: DONE
         @")\]",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    /// <summary>
-    /// Parses all action tags from Claude's response text.
-    /// Returns the spoken text (tags stripped) and all actions in document order.
-    /// </summary>
     public static ActionParseResult Parse(string fullText)
     {
         if (string.IsNullOrWhiteSpace(fullText))
@@ -96,20 +108,32 @@ public static class ActionTagParser
                     RightClick = match.Groups[4].Success
                 });
             }
-            else if (match.Groups[5].Success) // TYPE
+            else if (match.Groups[5].Success) // DBLCLICK
             {
-                actions.Add(new ActionTag.Type { Text = match.Groups[6].Value.Trim() });
+                actions.Add(new ActionTag.DoubleClick
+                {
+                    X = int.Parse(match.Groups[6].Value),
+                    Y = int.Parse(match.Groups[7].Value)
+                });
             }
-            else if (match.Groups[7].Success) // OPEN
+            else if (match.Groups[8].Success) // TYPE
             {
-                actions.Add(new ActionTag.Open { AppName = match.Groups[8].Value.Trim() });
+                actions.Add(new ActionTag.Type { Text = match.Groups[9].Value.Trim() });
             }
-            else if (match.Groups[9].Success) // WAIT
+            else if (match.Groups[10].Success) // OPEN
             {
-                if (int.TryParse(match.Groups[10].Value, out int ms))
+                actions.Add(new ActionTag.Open { AppName = match.Groups[11].Value.Trim() });
+            }
+            else if (match.Groups[12].Success) // KEYPRESS
+            {
+                actions.Add(new ActionTag.KeyPress { Combo = match.Groups[13].Value.Trim() });
+            }
+            else if (match.Groups[14].Success) // WAIT
+            {
+                if (int.TryParse(match.Groups[15].Value, out int ms))
                     actions.Add(new ActionTag.Wait { Milliseconds = Math.Clamp(ms, 0, 30_000) });
             }
-            else if (match.Groups[11].Success) // DONE
+            else if (match.Groups[16].Success) // DONE
             {
                 isDone = true;
             }
