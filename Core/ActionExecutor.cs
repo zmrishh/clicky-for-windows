@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using System.Threading;
 
 namespace ClickyWindows.Core;
@@ -215,19 +216,118 @@ public static class ActionExecutor
 
     /// <summary>
     /// Launches an application by name or path using the shell.
+    /// Spoken names (e.g. "apple music", "file explorer") are resolved to
+    /// their real executable or URI-scheme before launching.
     /// </summary>
     public static void OpenApp(string appName)
     {
+        var target = ResolveAppName(appName.Trim());
         try
         {
-            Process.Start(new ProcessStartInfo(appName) { UseShellExecute = true });
-            AppDebugLog.Write($"ActionExecutor: opened \"{appName}\"");
+            // URI-scheme targets (ms-music:, spotify:, etc.) must not receive
+            // a WorkingDirectory — set it to the user profile to be safe for
+            // both URI and executable targets.
+            Process.Start(new ProcessStartInfo(target)
+            {
+                UseShellExecute  = true,
+                WorkingDirectory = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+            });
+            AppDebugLog.Write($"ActionExecutor: opened \"{appName}\" -> \"{target}\"");
         }
         catch (Exception ex)
         {
-            AppDebugLog.Write($"ActionExecutor: open \"{appName}\" failed — {ex.Message}");
+            AppDebugLog.Write($"ActionExecutor: open \"{appName}\" (\"{target}\") failed — {ex.Message}");
             throw;
         }
+    }
+
+    // ── App name resolution ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Maps spoken / informal app names to the real executable name or URI
+    /// scheme that Windows can launch via UseShellExecute.
+    /// </summary>
+    private static readonly Dictionary<string, string> AppAliases =
+        new(StringComparer.OrdinalIgnoreCase)
+    {
+        // ── Music / media ────────────────────────────────────────────────────
+        ["apple music"]         = "ms-music:",
+        ["music"]               = "ms-music:",
+        ["spotify"]             = "spotify:",
+        ["vlc"]                 = "vlc",
+        ["media player"]        = "wmplayer",
+        ["windows media player"]= "wmplayer",
+        // ── Messaging / social ───────────────────────────────────────────────
+        ["whatsapp"]            = "whatsapp:",
+        ["telegram"]            = "telegram:",
+        ["discord"]             = "discord",
+        ["slack"]               = "slack",
+        ["teams"]               = "msteams:",
+        ["microsoft teams"]     = "msteams:",
+        ["zoom"]                = "zoom",
+        ["skype"]               = "skype:",
+        // ── Browsers ─────────────────────────────────────────────────────────
+        ["chrome"]              = "chrome",
+        ["google chrome"]       = "chrome",
+        ["brave"]               = "brave",
+        ["brave browser"]       = "brave",
+        ["firefox"]             = "firefox",
+        ["edge"]                = "msedge",
+        ["microsoft edge"]      = "msedge",
+        // ── System utilities ─────────────────────────────────────────────────
+        ["file explorer"]       = "explorer",
+        ["explorer"]            = "explorer",
+        ["notepad"]             = "notepad",
+        ["calculator"]          = "calc",
+        ["calc"]                = "calc",
+        ["paint"]               = "mspaint",
+        ["task manager"]        = "taskmgr",
+        ["settings"]            = "ms-settings:",
+        ["windows settings"]    = "ms-settings:",
+        ["cmd"]                 = "cmd",
+        ["command prompt"]      = "cmd",
+        ["powershell"]          = "powershell",
+        ["terminal"]            = "wt",
+        ["windows terminal"]    = "wt",
+        // ── Productivity / Office ─────────────────────────────────────────────
+        ["word"]                = "winword",
+        ["microsoft word"]      = "winword",
+        ["excel"]               = "excel",
+        ["microsoft excel"]     = "excel",
+        ["powerpoint"]          = "powerpnt",
+        ["microsoft powerpoint"]= "powerpnt",
+        ["outlook"]             = "outlook",
+        ["microsoft outlook"]   = "outlook",
+        ["onenote"]             = "onenote",
+        // ── Dev tools ────────────────────────────────────────────────────────
+        ["vs code"]             = "code",
+        ["vscode"]              = "code",
+        ["visual studio code"]  = "code",
+        ["visual studio"]       = "devenv",
+        // ── Store / photos / mail ─────────────────────────────────────────────
+        ["store"]               = "ms-windows-store:",
+        ["microsoft store"]     = "ms-windows-store:",
+        ["photos"]              = "ms-photos:",
+        ["mail"]                = "ms-outlook:",
+    };
+
+    /// <summary>
+    /// Strips filler words ("open X", "launch X") then looks up the alias table.
+    /// Falls back to the raw name so shell-execute can still try its luck.
+    /// </summary>
+    private static string ResolveAppName(string name)
+    {
+        if (AppAliases.TryGetValue(name, out var hit)) return hit;
+
+        // Strip leading verb: "open brave" → "brave"
+        var stripped = Regex.Replace(
+            name, @"^(open|launch|start|run)\s+", string.Empty,
+            RegexOptions.IgnoreCase).Trim();
+
+        if (AppAliases.TryGetValue(stripped, out var hit2)) return hit2;
+
+        // Return the stripped name so the shell can try (handles "notepad++", etc.)
+        return stripped.Length > 0 ? stripped : name;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
