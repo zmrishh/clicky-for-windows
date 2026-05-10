@@ -416,8 +416,11 @@ public static class ActionExecutor
     }
 
     /// <summary>
+    /// <summary>
     /// Expands environment variables and returns the first path that exists on disk.
-    /// Handles a trailing wildcard segment (e.g. app-*\Discord.exe) via directory scan.
+    /// Supports a single wildcard segment anywhere in the path (e.g. app-*\Discord.exe):
+    /// the non-wildcard prefix is treated as the search root, subdirectories matching the
+    /// glob are scanned, and the latest match by last-write time is returned.
     /// </summary>
     private static string? FindFirstExisting(string[] candidates)
     {
@@ -425,23 +428,36 @@ public static class ActionExecutor
         {
             var expanded = Environment.ExpandEnvironmentVariables(raw);
 
-            // Handle simple glob: one wildcard segment anywhere in the path
-            if (expanded.Contains('*'))
+            if (!expanded.Contains('*'))
             {
-                var dir  = Path.GetDirectoryName(expanded)!;
-                var file = Path.GetFileName(expanded);
-                if (Directory.Exists(dir))
-                {
-                    var match = Directory
-                        .EnumerateFiles(dir, file, SearchOption.AllDirectories)
-                        .OrderByDescending(File.GetLastWriteTimeUtc)
-                        .FirstOrDefault();
-                    if (match != null) return match;
-                }
+                if (File.Exists(expanded)) return expanded;
                 continue;
             }
 
-            if (File.Exists(expanded)) return expanded;
+            // Split at the first wildcard-containing segment.
+            // e.g. "C:\Users\x\AppData\Local\Discord\app-*\Discord.exe"
+            //   → searchRoot = "C:\Users\x\AppData\Local\Discord"
+            //   → subdirGlob = "app-*"
+            //   → fileName   = "Discord.exe"
+            char sep = Path.DirectorySeparatorChar;
+            var parts       = expanded.Split(sep, Path.AltDirectorySeparatorChar);
+            int wildcardIdx = Array.FindIndex(parts, p => p.Contains('*'));
+            if (wildcardIdx < 0) continue;
+
+            string searchRoot = string.Join(sep.ToString(), parts[..wildcardIdx]);
+            string subdirGlob = parts[wildcardIdx];
+            string fileName   = string.Join(sep.ToString(), parts[(wildcardIdx + 1)..]);
+
+            if (!Directory.Exists(searchRoot)) continue;
+
+            var match = Directory
+                .EnumerateDirectories(searchRoot, subdirGlob)
+                .Select(d => Path.Combine(d, fileName))
+                .Where(File.Exists)
+                .OrderByDescending(File.GetLastWriteTimeUtc)
+                .FirstOrDefault();
+
+            if (match != null) return match;
         }
         return null;
     }

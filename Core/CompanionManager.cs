@@ -995,10 +995,12 @@ public sealed class CompanionManager : IDisposable
         List<ScreenCaptureData> initialCaptures,
         CancellationToken   ct)
     {
-        var completedSteps = new List<string>();
-        var current        = firstResult;
-        var captures       = initialCaptures;
-        int iteration      = 0;
+        var completedSteps   = new List<string>();
+        var current          = firstResult;
+        var captures         = initialCaptures;
+        int iteration        = 0;
+        string? lastStepKey  = null;   // fingerprint of last executed action for stuck detection
+        int     repeatCount  = 0;      // consecutive repeats of the same action
 
         while (true)
         {
@@ -1035,11 +1037,43 @@ public sealed class CompanionManager : IDisposable
 
             if (current.IsDone) break;
 
-            // Pause so any triggered UI animation settles before we screenshot
-            await Task.Delay(AppConstants.ActionStepPauseMs, ct);
+            // Stuck-loop detection: if the same action fires twice in a row,
+            // inject a hint into the continuation prompt telling Claude to try differently.
+            string currentStepKey = string.Join("|", current.Actions
+                .Where(a => a is not ActionTag.Wait)
+                .Select(StepDescription));
+
+            bool isStuck = false;
+            if (currentStepKey == lastStepKey && !string.IsNullOrEmpty(currentStepKey))
+            {
+                repeatCount++;
+                if (repeatCount >= 2)
+                {
+                    AppDebugLog.Write($"Agent loop: stuck on \"{currentStepKey}\" — bailing after {repeatCount} repeats.");
+                    WpfApp.Current.Dispatcher.Invoke(() =>
+                        _overlayManager.ShowResponse("hmm, i keep hitting the same spot. let me try a different approach."));
+                    _ = RunTtsAsync("hmm, i keep hitting the same spot. let me try a different approach.", ct);
+                    break;
+                }
+                isStuck = true;
+                AppDebugLog.Write($"Agent loop: same action repeated ({repeatCount}x) — flagging as stuck in next prompt.");
+            }
+            else
+            {
+                repeatCount = 0;
+            }
+            lastStepKey = currentStepKey;
+
+            // Pause so the UI settles before we screenshot. Use a longer pause
+            // after Navigate actions because page loads take more time.
+            var lastAction = current.Actions.LastOrDefault(a => a is not ActionTag.Wait);
+            int loopPauseMs = lastAction is ActionTag.Navigate or ActionTag.Open
+                ? AppConstants.NavigateStepPauseMs
+                : AppConstants.ActionStepPauseMs;
 
             // Re-screenshot and ask Claude what to do next
-            AppDebugLog.Write($"Agent loop: iteration {iteration} complete, asking Claude for next step.");
+            AppDebugLog.Write($"Agent loop: iteration {iteration} complete (pause {loopPauseMs}ms), asking Claude for next step.");
+            await Task.Delay(loopPauseMs, ct);
             captures = await Task.Run(ScreenCaptureService.CaptureAllScreens, ct);
 
             var images = captures.Select(c => (
@@ -1048,7 +1082,13 @@ public sealed class CompanionManager : IDisposable
             )).ToList();
 
             string doneList = string.Join(", ", completedSteps);
-            string contPrompt = $"original task: \"{originalTranscript}\"\nsteps completed so far: {doneList}\n\n" +
+            string stuckHint = isStuck
+                ? $"\nWARNING: you already tried \"{currentStepKey}\" and it didn't advance the task. " +
+                  "do NOT repeat the same action. try a completely different approach: " +
+                  "use a keyboard shortcut, right-click for a context menu, scroll to find the element, " +
+                  "use [KEYPRESS:] instead of clicking, or navigate to a different URL. if the task is impossible, say so and end with [DONE]."
+                : "";
+            string contPrompt = $"original task: \"{originalTranscript}\"\nsteps completed so far: {doneList}{stuckHint}\n\n" +
                                 "look at the current screenshot. what is the single next step to complete the task? " +
                                 "if the full task is now complete, say so and end with [DONE] — no action tags. " +
                                 "otherwise give your brief spoken text + the next action tag(s). " +
@@ -1156,7 +1196,14 @@ public sealed class CompanionManager : IDisposable
             var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             WpfApp.Current.Dispatcher.Invoke(() =>
                 _overlayManager.ShowActionToast(label, AppConstants.ActionToastHoldMs, () => tcs.TrySetResult(true)));
-            await tcs.Task.WaitAsync(ct);
+
+            // Cap the wait: if the overlay is closed or the timer never fires,
+            // don't block forever — proceed after 2× the intended hold time.
+            var maxWait = TimeSpan.FromMilliseconds(AppConstants.ActionToastHoldMs * 2 + 500);
+            using var toastCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            toastCts.CancelAfter(maxWait);
+            try { await tcs.Task.WaitAsync(toastCts.Token); }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested) { /* timeout — continue */ }
             ct.ThrowIfCancellationRequested();
 
             try
@@ -1556,18 +1603,24 @@ public sealed class CompanionManager : IDisposable
 
         IMPORTANT for browser navigation:
         - NEVER open a new tab to navigate somewhere. use [NAVIGATE:url] to go to a URL in the current tab.
-        - if a browser isn't open yet, use [OPEN:brave] (or chrome/edge) first, then [WAIT:800], then [NAVIGATE:url].
+        - if a browser isn't open yet: [OPEN:brave] then [WAIT:1500] then [NAVIGATE:url] — the WAIT is mandatory, the browser needs time to launch before Ctrl+L works.
         - [KEYPRESS:Ctrl+T] and [KEYPRESS:Ctrl+L] are only for explicitly tab/address-bar tasks — never use them just to navigate.
 
         IMPORTANT for WhatsApp Web (https://web.whatsapp.com):
         step-by-step workflow:
-        1. if WhatsApp Web isn't open: [OPEN:brave] → [WAIT:1000] → [NAVIGATE:https://web.whatsapp.com] → [WAIT:3000]
+        1. if WhatsApp Web isn't open: [OPEN:brave] → [WAIT:1500] → [NAVIGATE:https://web.whatsapp.com] → [WAIT:3000]
         2. if WhatsApp Web is already open: [NAVIGATE:https://web.whatsapp.com] → [WAIT:2000]
         3. click the search box at the top of the left panel → [TYPE:contact name]
         4. [WAIT:1000] → click the correct chat from the results
         5. click the message input bar at the bottom → [TYPE:composed message] → [KEYPRESS:Enter]
         - compose a proper, natural-sounding message — not the user's raw words.
         - always end with [KEYPRESS:Enter] to send. never skip it.
+
+        IMPORTANT — when a click or action doesn't work:
+        - if you clicked something and the screen didn't change as expected, do NOT click the same place again.
+        - try a completely different approach: use keyboard shortcuts ([KEYPRESS:]), right-click for a context menu ([CLICK:x,y:right]), scroll to find the element, or navigate to a different URL.
+        - if a button click had no effect, try pressing Enter or Tab instead.
+        - if you cannot complete the task after trying alternatives, say so clearly and end with [DONE].
 
         for multi-step tasks: only plan what you can see RIGHT NOW in the current screenshot. append the first 1-3 actions that get the ball rolling. after those execute, you'll automatically be shown the new screen state and asked what to do next. do NOT try to plan coordinates for screens you haven't seen yet.
 
@@ -1613,7 +1666,14 @@ public sealed class CompanionManager : IDisposable
 
         IMPORTANT for browser navigation:
         - use [NAVIGATE:url] to go somewhere in the current tab. NEVER use [KEYPRESS:Ctrl+T] just to navigate.
-        - WhatsApp Web workflow: search box (click it → TYPE contact name → WAIT → click result) → message bar (click it → TYPE message → KEYPRESS:Enter).
+        - if a browser isn't open yet: [OPEN:brave] → [WAIT:1500] → [NAVIGATE:url]. the WAIT is mandatory.
+        - WhatsApp Web workflow: search box (click it → TYPE contact name → WAIT:1000 → click result) → message bar (click it → TYPE message → KEYPRESS:Enter).
+
+        IMPORTANT — when a click or action doesn't work:
+        - if the screen didn't change as expected after a click, do NOT click the same spot again.
+        - try a completely different approach: use keyboard shortcuts, right-click for context menu, scroll to reveal the element, or use [NAVIGATE:] to a relevant URL.
+        - if a button click did nothing, try [KEYPRESS:Enter] or [KEYPRESS:Tab] instead.
+        - if you truly cannot complete the task, explain why and end with [DONE].
         """;
 
 

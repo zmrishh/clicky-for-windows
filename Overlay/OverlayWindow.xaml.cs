@@ -532,6 +532,7 @@ public sealed partial class OverlayWindow : Window
     /// <summary>
     /// Shows Claude's full reply in the existing blue NavBubble next to the cursor.
     /// Auto-dismisses after 8 seconds. Safe to call from any thread.
+    /// If a pointing animation is in progress it is cancelled so the text is always visible.
     /// </summary>
     public void ShowResponse(string text)
     {
@@ -539,8 +540,19 @@ public sealed partial class OverlayWindow : Window
         {
             _responseDismissTimer?.Stop();
 
-            // If a pointing flight is in progress, let it finish — don't hijack it.
-            if (_navMode != BuddyNavigationMode.FollowingCursor) return;
+            // Cancel any pointing animation so the response text is always shown.
+            // This handles the case where the agent loop speaks during a pointing flight.
+            if (_navMode != BuddyNavigationMode.FollowingCursor)
+            {
+                _flightTimer?.Stop();
+                _flightTimer = null;
+                _navMode = BuddyNavigationMode.FollowingCursor;
+                _isReturningToCursor = false;
+                TriangleRotate.Angle  = -35.0;
+                TriangleScale.ScaleX  = 1.0;
+                TriangleScale.ScaleY  = 1.0;
+                TriangleGlow.BlurRadius = 10;
+            }
 
             NavBubbleText.Text = text;
             NavBubble.Visibility = Visibility.Visible;
