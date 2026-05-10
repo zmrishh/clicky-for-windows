@@ -68,6 +68,13 @@ public abstract class ActionTag
         public string Url { get; init; } = "";
     }
 
+    /// <summary>Move the cursor to a position without clicking — reveals hover-only UI (video controls, tooltips, dropdowns).</summary>
+    public sealed class Hover : ActionTag
+    {
+        public int X { get; init; }
+        public int Y { get; init; }
+    }
+
     /// <summary>Pause for <see cref="Milliseconds"/> before the next step.</summary>
     public sealed class Wait : ActionTag
     {
@@ -83,17 +90,19 @@ public static class ActionTagParser
             @"|" +
             @"(DBLCLICK)\s*:\s*(\d+)\s*,\s*(\d+)" +                    // 5-7: DBLCLICK
             @"|" +
-            @"(TYPE)\s*:\s*([^\]]+)" +                                   // 8-9: TYPE
+            @"(HOVER)\s*:\s*(\d+)\s*,\s*(\d+)" +                       // 8-10: HOVER
             @"|" +
-            @"(OPEN)\s*:\s*([^\]]+)" +                                   // 10-11: OPEN
+            @"(TYPE)\s*:\s*([^\]]+)" +                                   // 11-12: TYPE
             @"|" +
-            @"(KEYPRESS)\s*:\s*([^\]]+)" +                              // 12-13: KEYPRESS
+            @"(OPEN)\s*:\s*([^\]]+)" +                                   // 13-14: OPEN
             @"|" +
-            @"(WAIT)\s*:\s*(\d+)" +                                      // 14-15: WAIT
+            @"(KEYPRESS)\s*:\s*([^\]]+)" +                              // 15-16: KEYPRESS
             @"|" +
-            @"(NAVIGATE)\s*:\s*([^\]]+)" +                               // 16-17: NAVIGATE
+            @"(WAIT)\s*:\s*(\d+)" +                                      // 17-18: WAIT
             @"|" +
-            @"(DONE)" +                                                   // 18: DONE
+            @"(NAVIGATE)\s*:\s*([^\]]+)" +                               // 19-20: NAVIGATE
+            @"|" +
+            @"(DONE)" +                                                   // 21: DONE
         @")\]",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
@@ -124,28 +133,36 @@ public static class ActionTagParser
                     Y = int.Parse(match.Groups[7].Value)
                 });
             }
-            else if (match.Groups[8].Success) // TYPE
+            else if (match.Groups[8].Success) // HOVER
             {
-                actions.Add(new ActionTag.Type { Text = match.Groups[9].Value.Trim() });
+                actions.Add(new ActionTag.Hover
+                {
+                    X = int.Parse(match.Groups[9].Value),
+                    Y = int.Parse(match.Groups[10].Value)
+                });
             }
-            else if (match.Groups[10].Success) // OPEN
+            else if (match.Groups[11].Success) // TYPE
             {
-                actions.Add(new ActionTag.Open { AppName = match.Groups[11].Value.Trim() });
+                actions.Add(new ActionTag.Type { Text = match.Groups[12].Value.Trim() });
             }
-            else if (match.Groups[12].Success) // KEYPRESS
+            else if (match.Groups[13].Success) // OPEN
             {
-                actions.Add(new ActionTag.KeyPress { Combo = match.Groups[13].Value.Trim() });
+                actions.Add(new ActionTag.Open { AppName = match.Groups[14].Value.Trim() });
             }
-            else if (match.Groups[14].Success) // WAIT
+            else if (match.Groups[15].Success) // KEYPRESS
             {
-                if (int.TryParse(match.Groups[15].Value, out int ms))
+                actions.Add(new ActionTag.KeyPress { Combo = match.Groups[16].Value.Trim() });
+            }
+            else if (match.Groups[17].Success) // WAIT
+            {
+                if (int.TryParse(match.Groups[18].Value, out int ms))
                     actions.Add(new ActionTag.Wait { Milliseconds = Math.Clamp(ms, 0, 30_000) });
             }
-            else if (match.Groups[16].Success) // NAVIGATE
+            else if (match.Groups[19].Success) // NAVIGATE
             {
-                actions.Add(new ActionTag.Navigate { Url = match.Groups[17].Value.Trim() });
+                actions.Add(new ActionTag.Navigate { Url = match.Groups[20].Value.Trim() });
             }
-            else if (match.Groups[18].Success) // DONE
+            else if (match.Groups[21].Success) // DONE
             {
                 isDone = true;
             }

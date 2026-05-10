@@ -90,6 +90,7 @@ public static class ActionExecutor
     private const ushort VK_RETURN = 0x0D;
     private const ushort VK_TAB    = 0x09;
     private const ushort VK_ESC    = 0x1B;
+    private const ushort VK_SPACE  = 0x20;
     private const ushort VK_F4     = 0x73;
     private const ushort VK_UP     = 0x26;
     private const ushort VK_DOWN   = 0x28;
@@ -164,6 +165,7 @@ public static class ActionExecutor
                 "enter" or "return"          => VK_RETURN,
                 "tab"                        => VK_TAB,
                 "esc"   or "escape"          => VK_ESC,
+                "space" or "spacebar"        => VK_SPACE,
                 "f4"                         => VK_F4,
                 "up"                         => VK_UP,
                 "down"                       => VK_DOWN,
@@ -213,6 +215,18 @@ public static class ActionExecutor
         var arr = inputs.ToArray();
         SendInput((uint)arr.Length, arr, Marshal.SizeOf<INPUT>());
         AppDebugLog.Write($"ActionExecutor: typed {text.Length} chars");
+    }
+
+    /// <summary>
+    /// Moves the cursor to the given position without clicking.
+    /// Use before clicking elements whose controls only appear on hover
+    /// (e.g. Netflix / YouTube video controls, dropdown menus, tooltips).
+    /// </summary>
+    public static void Hover(int physX, int physY)
+    {
+        var (nx, ny) = Normalise(physX, physY);
+        SendInput(1, [MoveInput(nx, ny)], Marshal.SizeOf<INPUT>());
+        AppDebugLog.Write($"ActionExecutor: hover physXY=({physX},{physY})");
     }
 
     /// <summary>

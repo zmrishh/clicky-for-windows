@@ -815,6 +815,8 @@ public sealed class CompanionManager : IDisposable
                 }
 
                 AppDebugLog.Write($"Claude returned text chars={fullText.Trim().Length}.");
+                // Log a truncated preview of the raw response for tag-missing diagnosis
+                AppDebugLog.Write($"Claude raw preview: {fullText.Trim().Replace('\n', ' ')[..Math.Min(fullText.Trim().Length, 300)]}");
 
                 if (string.IsNullOrWhiteSpace(fullText))
                 {
@@ -1112,6 +1114,7 @@ public sealed class CompanionManager : IDisposable
             }
 
             AppDebugLog.Write($"Agent loop iteration {iteration}: Claude returned {nextText.Length} chars");
+            AppDebugLog.Write($"Agent loop raw preview: {nextText.Trim().Replace('\n', ' ')[..Math.Min(nextText.Trim().Length, 300)]}");
 
             current = ActionTagParser.Parse(nextText);
 
@@ -1133,6 +1136,7 @@ public sealed class CompanionManager : IDisposable
         {
             ActionTag.Click      c  => c.RightClick ? "right-clicking." : "clicking.",
             ActionTag.DoubleClick _  => "opening that.",
+            ActionTag.Hover      _  => "hovering over that.",
             ActionTag.Type       _  => "typing that for you.",
             ActionTag.Open       o  => $"opening {o.AppName}.",
             ActionTag.Navigate   _  => "navigating there.",
@@ -1244,6 +1248,7 @@ public sealed class CompanionManager : IDisposable
         {
             ActionTag.Click      c  => c.RightClick ? $"right-clicking...{suffix}" : $"clicking...{suffix}",
             ActionTag.DoubleClick _  => $"opening...{suffix}",
+            ActionTag.Hover      _  => $"hovering...{suffix}",
             ActionTag.Type       t  => $"typing: {t.Text.Truncate(28)}{suffix}",
             ActionTag.Open       o  => $"opening {o.AppName}...{suffix}",
             ActionTag.Navigate   n  => $"navigating to {n.Url.Truncate(30)}...{suffix}",
@@ -1256,6 +1261,7 @@ public sealed class CompanionManager : IDisposable
     {
         ActionTag.Click      c  => c.RightClick ? $"right-clicked ({c.X},{c.Y})" : $"clicked ({c.X},{c.Y})",
         ActionTag.DoubleClick d => $"double-clicked ({d.X},{d.Y})",
+        ActionTag.Hover      h  => $"hovered ({h.X},{h.Y})",
         ActionTag.Type       t  => $"typed \"{t.Text.Truncate(20)}\"",
         ActionTag.Open       o  => $"opened {o.AppName}",
         ActionTag.Navigate   n  => $"navigated to {n.Url.Truncate(40)}",
@@ -1289,6 +1295,18 @@ public sealed class CompanionManager : IDisposable
                     ActionExecutor.DoubleClick(
                         ct2.PhysicalBounds.X + (int)(dblClick.X * sx2),
                         ct2.PhysicalBounds.Y + (int)(dblClick.Y * sy2));
+                }
+                break;
+
+            case ActionTag.Hover hover:
+                var ct3 = captures.FirstOrDefault(c => c.IsCursorScreen) ?? captures.FirstOrDefault();
+                if (ct3 != null)
+                {
+                    double sx3 = ct3.PhysicalBounds.Width  / (double)ct3.ScreenshotWidthPx;
+                    double sy3 = ct3.PhysicalBounds.Height / (double)ct3.ScreenshotHeightPx;
+                    ActionExecutor.Hover(
+                        ct3.PhysicalBounds.X + (int)(hover.X * sx3),
+                        ct3.PhysicalBounds.Y + (int)(hover.Y * sy3));
                 }
                 break;
 
@@ -1565,6 +1583,8 @@ public sealed class CompanionManager : IDisposable
         performing actions:
         you can do things on screen — click buttons, type text, open applications, or run multi-step tasks. only use actions when the user explicitly asks you to do something. never act without being asked.
 
+        RULE: if you say you will do something, you MUST include the action tag. saying "i'll click play" without [CLICK:x,y] is an error — the action will never execute. every promise in your spoken text must have a matching tag. if you can't confidently identify the exact element coordinates, say so and explain rather than making a promise you can't back up.
+
         IMPORTANT — before opening any app:
         - look at the current screenshot carefully. check the taskbar, desktop, open windows, and system tray.
         - if the app is already open or visible in the taskbar, click on it to bring it to focus — don't launch a new instance.
@@ -1575,12 +1595,20 @@ public sealed class CompanionManager : IDisposable
         - [CLICK:x,y] — left-click at screenshot pixel coordinates x,y
         - [CLICK:x,y:right] — right-click at x,y
         - [DBLCLICK:x,y] — double-click (use this to OPEN files, folders, apps — never single-click to open)
+        - [HOVER:x,y] — move cursor to position WITHOUT clicking (use to reveal hidden controls: video players, dropdown menus, tooltips)
         - [TYPE:the text to type] — type text into the focused window
         - [OPEN:app name] — launch an application by name (e.g. notepad, chrome, brave, explorer)
         - [NAVIGATE:https://url] — navigate the CURRENT browser tab to a URL (uses Ctrl+L → type URL → Enter). use this instead of opening a new tab.
         - [KEYPRESS:combo] — press a key combo, e.g. Win+Down (minimize), Win+Up (maximize), Alt+F4 (close), Ctrl+W (close tab), Ctrl+T (new tab), Win+D (show desktop), Enter (confirm/send)
         - [WAIT:ms] — pause for ms milliseconds before the next step
         - [DONE] — signal that the full multi-step task is now complete
+
+        IMPORTANT for video players (Netflix, YouTube, Prime Video, etc.):
+        - video controls (play, pause, seek bar) are HIDDEN until the mouse hovers over the video.
+        - NEVER try to click a play button cold — it won't be there in the screenshot yet.
+        - correct sequence: [HOVER:x,y] over the video center → [WAIT:600] → screenshot updates → then [CLICK:x,y] the now-visible play/pause button.
+        - if the video is full-screen in a browser, hover over the lower-center area where controls appear.
+        - for Netflix specifically: hover near bottom-center of the video → wait → click the play/pause circle button.
 
         IMPORTANT window/tab operations:
         - "minimize" or "minimize window" → [KEYPRESS:Win+Down]
@@ -1638,8 +1666,9 @@ public sealed class CompanionManager : IDisposable
         - look at the screenshot carefully. identify exactly what element needs to be interacted with.
         - give ONE short spoken sentence describing what you're doing (casual, lowercase, written for TTS).
         - append the appropriate action tag for the next step.
+        - RULE: if your spoken text says you will do something, you MUST include the matching tag. "I'll click play" without [CLICK:] is an error — it does nothing. every action you describe must have a tag.
         - if the full task is now complete with no more steps needed, say so in one sentence and end with [DONE] — no action tags.
-        - use screenshot pixel coordinates for CLICK/DBLCLICK. origin (0,0) is top-left of the screenshot.
+        - use screenshot pixel coordinates for CLICK/DBLCLICK/HOVER. origin (0,0) is top-left of the screenshot.
         - never plan ahead for screens you haven't seen. only act on what's visible right now.
         - do not ask questions. just act or signal done.
 
@@ -1652,12 +1681,18 @@ public sealed class CompanionManager : IDisposable
         - [CLICK:x,y] — left-click (for selecting, activating buttons, etc.)
         - [CLICK:x,y:right] — right-click
         - [DBLCLICK:x,y] — double-click — USE THIS to open folders, files, and apps in File Explorer or desktop. a single CLICK only selects, it does NOT open.
+        - [HOVER:x,y] — move cursor WITHOUT clicking — use to reveal hidden controls (video player controls, tooltips, dropdowns). always hover first, wait, then click.
         - [TYPE:text] — type into focused window
         - [OPEN:app] — launch application by name
         - [NAVIGATE:https://url] — navigate current browser tab to a URL (Ctrl+L → type → Enter). NEVER open new tabs just to navigate.
-        - [KEYPRESS:combo] — keyboard shortcut (e.g. Win+Down=minimize, Win+Up=maximize, Alt+F4=close window, Ctrl+W=close tab, Enter=confirm/send)
+        - [KEYPRESS:combo] — keyboard shortcut (e.g. Win+Down=minimize, Win+Up=maximize, Alt+F4=close window, Ctrl+W=close tab, Enter=confirm/send, Space=play/pause)
         - [WAIT:ms] — pause ms milliseconds
         - [DONE] — task complete, stop
+
+        IMPORTANT for video players (Netflix, YouTube, Prime, etc.):
+        - controls are hidden until hover. NEVER click a play button without hovering first.
+        - correct flow: [HOVER:x,y] center of video → [WAIT:600] → [CLICK:x,y] the now-visible play button.
+        - alternatively: [KEYPRESS:Space] to play/pause without needing to find the button visually.
 
         IMPORTANT for typing messages (WhatsApp, Telegram, email, chat apps, etc.):
         - if the task involves sending a message, compose a complete, natural, well-written version — don't just type the user's raw words.
