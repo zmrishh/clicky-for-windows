@@ -1585,11 +1585,22 @@ public sealed class CompanionManager : IDisposable
 
         RULE: if you say you will do something, you MUST include the action tag. saying "i'll click play" without [CLICK:x,y] is an error — the action will never execute. every promise in your spoken text must have a matching tag. if you can't confidently identify the exact element coordinates, say so and explain rather than making a promise you can't back up.
 
-        IMPORTANT — before opening any app:
-        - look at the current screenshot carefully. check the taskbar, desktop, open windows, and system tray.
-        - if the app is already open or visible in the taskbar, click on it to bring it to focus — don't launch a new instance.
-        - if you can see a desktop shortcut or taskbar icon for the app, click it rather than using [OPEN:].
-        - only use [OPEN:app] when the app isn't visible anywhere on screen.
+        IMPORTANT — finding and switching to apps (taskbar may be auto-hidden):
+        the taskbar may be auto-hidden and NOT visible in the screenshot — this is normal. do NOT assume an app is closed just because you can't see it in the taskbar.
+
+        to find an app or switch to it, think like a human:
+        1. first: check if the app window is already visible anywhere on screen — click on it.
+        2. if not visible, try [KEYPRESS:Alt+Tab] to cycle through open windows and find it.
+        3. if still not found (or app needs to be launched): use the Start menu search:
+           [KEYPRESS:Win] → [WAIT:600] → [TYPE:app name] → [WAIT:800] → [KEYPRESS:Enter] → [WAIT:2000]
+           this works for ANY app: Apple Music, Spotify, WhatsApp, File Explorer, everything.
+        4. [OPEN:appname] is a shortcut for well-known apps — use it, but if the spoken name is unusual or the OS app (like Apple Music, iTunes), prefer the Win search approach instead.
+
+        window switching:
+        - [KEYPRESS:Alt+Tab] — cycle forward through open windows (tap once per switch)
+        - [KEYPRESS:Alt+Shift+Tab] — cycle backward
+        - [KEYPRESS:Win+D] — show desktop (hide all windows)
+        - to switch to a specific app by name: [KEYPRESS:Win] → [WAIT:600] → [TYPE:app name] → [KEYPRESS:Enter]
 
         available action tags (append after your spoken text):
         - [CLICK:x,y] — left-click at screenshot pixel coordinates x,y
@@ -1599,7 +1610,7 @@ public sealed class CompanionManager : IDisposable
         - [TYPE:the text to type] — type text into the focused window
         - [OPEN:app name] — launch an application by name (e.g. notepad, chrome, brave, explorer)
         - [NAVIGATE:https://url] — navigate the CURRENT browser tab to a URL (uses Ctrl+L → type URL → Enter). use this instead of opening a new tab.
-        - [KEYPRESS:combo] — press a key combo, e.g. Win+Down (minimize), Win+Up (maximize), Alt+F4 (close), Ctrl+W (close tab), Ctrl+T (new tab), Win+D (show desktop), Enter (confirm/send)
+        - [KEYPRESS:combo] — press a key combo, e.g. Win (open Start), Alt+Tab (switch window), Win+Down (minimize), Win+Up (maximize), Alt+F4 (close), Ctrl+W (close tab), Ctrl+T (new tab), Win+D (show desktop), Enter (confirm/send), Space (play/pause), F5 (refresh)
         - [WAIT:ms] — pause for ms milliseconds before the next step
         - [DONE] — signal that the full multi-step task is now complete
 
@@ -1672,10 +1683,20 @@ public sealed class CompanionManager : IDisposable
         - never plan ahead for screens you haven't seen. only act on what's visible right now.
         - do not ask questions. just act or signal done.
 
-        IMPORTANT — before opening any app:
-        - scan the taskbar, desktop, and open windows in the screenshot first.
-        - if the app is already open or pinned to the taskbar, CLICK on it to bring it to focus — do not use [OPEN:].
-        - only use [OPEN:app] when the app is nowhere to be found on screen.
+        IMPORTANT — finding and switching to apps (taskbar may be auto-hidden):
+        the taskbar may be auto-hidden and NOT visible in the screenshot — this is normal. don't assume an app is closed just because the taskbar is hidden or the icon isn't visible.
+
+        think like a human looking for an app:
+        1. check if the app window is already visible on screen — if yes, click it.
+        2. if not visible: try [KEYPRESS:Alt+Tab] to cycle through open windows.
+        3. if still not found: use Win search to launch it:
+           [KEYPRESS:Win] → [WAIT:600] → [TYPE:app name] → [WAIT:800] → [KEYPRESS:Enter] → [WAIT:2000]
+        4. [OPEN:appname] is a shortcut — use it for common apps, but for Store apps (Apple Music, Spotify) or anything unusual, Win search is more reliable.
+
+        window switching:
+        - [KEYPRESS:Alt+Tab] — switch to the previous window (one tap = one switch)
+        - [KEYPRESS:Alt+Tab] multiple times to cycle through all open windows
+        - [KEYPRESS:Win+D] — show desktop
 
         available action tags:
         - [CLICK:x,y] — left-click (for selecting, activating buttons, etc.)
@@ -1685,7 +1706,7 @@ public sealed class CompanionManager : IDisposable
         - [TYPE:text] — type into focused window
         - [OPEN:app] — launch application by name
         - [NAVIGATE:https://url] — navigate current browser tab to a URL (Ctrl+L → type → Enter). NEVER open new tabs just to navigate.
-        - [KEYPRESS:combo] — keyboard shortcut (e.g. Win+Down=minimize, Win+Up=maximize, Alt+F4=close window, Ctrl+W=close tab, Enter=confirm/send, Space=play/pause)
+        - [KEYPRESS:combo] — keyboard shortcut (e.g. Win=open Start, Alt+Tab=switch window, Win+Down=minimize, Win+Up=maximize, Alt+F4=close window, Ctrl+W=close tab, Enter=confirm/send, Space=play/pause, F5=refresh)
         - [WAIT:ms] — pause ms milliseconds
         - [DONE] — task complete, stop
 

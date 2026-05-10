@@ -91,13 +91,28 @@ public static class ActionExecutor
     private const ushort VK_TAB    = 0x09;
     private const ushort VK_ESC    = 0x1B;
     private const ushort VK_SPACE  = 0x20;
+    // Function keys
+    private const ushort VK_F1     = 0x70;
+    private const ushort VK_F2     = 0x71;
+    private const ushort VK_F3     = 0x72;
     private const ushort VK_F4     = 0x73;
+    private const ushort VK_F5     = 0x74;
+    private const ushort VK_F6     = 0x75;
+    private const ushort VK_F7     = 0x76;
+    private const ushort VK_F8     = 0x77;
+    private const ushort VK_F9     = 0x78;
+    private const ushort VK_F10    = 0x79;
+    private const ushort VK_F11    = 0x7A;
+    private const ushort VK_F12    = 0x7B;
+    // Navigation
     private const ushort VK_UP     = 0x26;
     private const ushort VK_DOWN   = 0x28;
     private const ushort VK_LEFT   = 0x25;
     private const ushort VK_RIGHT  = 0x27;
     private const ushort VK_HOME   = 0x24;
     private const ushort VK_END    = 0x23;
+    private const ushort VK_PGUP   = 0x21;
+    private const ushort VK_PGDN   = 0x22;
     private const ushort VK_DELETE = 0x2E;
     private const ushort VK_BACK   = 0x08;
 
@@ -166,13 +181,26 @@ public static class ActionExecutor
                 "tab"                        => VK_TAB,
                 "esc"   or "escape"          => VK_ESC,
                 "space" or "spacebar"        => VK_SPACE,
+                "f1"                         => VK_F1,
+                "f2"                         => VK_F2,
+                "f3"                         => VK_F3,
                 "f4"                         => VK_F4,
+                "f5"                         => VK_F5,
+                "f6"                         => VK_F6,
+                "f7"                         => VK_F7,
+                "f8"                         => VK_F8,
+                "f9"                         => VK_F9,
+                "f10"                        => VK_F10,
+                "f11"                        => VK_F11,
+                "f12"                        => VK_F12,
                 "up"                         => VK_UP,
                 "down"                       => VK_DOWN,
                 "left"                       => VK_LEFT,
                 "right"                      => VK_RIGHT,
                 "home"                       => VK_HOME,
                 "end"                        => VK_END,
+                "pgup"  or "pageup"          => VK_PGUP,
+                "pgdn"  or "pagedown"        => VK_PGDN,
                 "delete" or "del"            => VK_DELETE,
                 "backspace" or "back"        => VK_BACK,
                 _ when p.Length == 1         => (ushort)(VkKeyScan(p[0]) & 0xFF),
