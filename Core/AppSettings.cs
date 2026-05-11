@@ -24,6 +24,14 @@ public sealed class AppSettings
     [JsonPropertyName("hasSubmittedEmail")]
     public bool HasSubmittedEmail { get; set; } = false;
 
+    /// <summary>
+    /// Facts the user has asked Clicky to remember (e.g. "my name is Alex").
+    /// Injected into the system prompt so Claude always has personal context.
+    /// Capped at <see cref="AppConstants.MemoryMaxFacts"/> entries; oldest is dropped when full.
+    /// </summary>
+    [JsonPropertyName("userFacts")]
+    public List<string> UserFacts { get; set; } = [];
+
     // ── Persistence ──────────────────────────────────────────────────────────
 
     private static readonly JsonSerializerOptions SerializerOptions = new()

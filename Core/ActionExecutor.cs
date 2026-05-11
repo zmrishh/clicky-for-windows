@@ -74,8 +74,13 @@ public static class ActionExecutor
     private const uint MOUSEEVENTF_LEFTUP      = 0x0004;
     private const uint MOUSEEVENTF_RIGHTDOWN   = 0x0008;
     private const uint MOUSEEVENTF_RIGHTUP     = 0x0010;
+    private const uint MOUSEEVENTF_WHEEL       = 0x0800;
+    private const uint MOUSEEVENTF_HWHEEL      = 0x1000;
     private const uint MOUSEEVENTF_ABSOLUTE    = 0x8000;
     private const uint MOUSEEVENTF_VIRTUALDESK = 0x4000;
+
+    // One Windows scroll "click" = 120 WHEEL_DELTA units
+    private const int WHEEL_DELTA = 120;
 
     private const uint KEYEVENTF_UNICODE  = 0x0004;
     private const uint KEYEVENTF_KEYUP    = 0x0002;
@@ -255,6 +260,72 @@ public static class ActionExecutor
         var (nx, ny) = Normalise(physX, physY);
         SendInput(1, [MoveInput(nx, ny)], Marshal.SizeOf<INPUT>());
         AppDebugLog.Write($"ActionExecutor: hover physXY=({physX},{physY})");
+    }
+
+    /// <summary>
+    /// Scrolls the mouse wheel at the given physical screen pixel position.
+    /// Moves the cursor to the target first so the correct scroll target receives the event.
+    /// </summary>
+    /// <param name="direction">up | down | left | right</param>
+    /// <param name="amount">Number of wheel-click units (1 = one detent = 120 WHEEL_DELTA).</param>
+    public static void Scroll(int physX, int physY, string direction, int amount = 3)
+    {
+        var (nx, ny) = Normalise(physX, physY);
+        SendInput(1, [MoveInput(nx, ny)], Marshal.SizeOf<INPUT>());
+        Thread.Sleep(30);
+
+        bool isHorizontal = direction is "left" or "right";
+        bool isPositive   = direction is "down" or "right"; // wheel forward = down/right
+        int  delta        = (isPositive ? -1 : 1) * WHEEL_DELTA * amount;
+
+        var scrollInput = new INPUT
+        {
+            type = INPUT_MOUSE,
+            u    = new INPUTUNION
+            {
+                mi = new MOUSEINPUT
+                {
+                    dx          = nx,
+                    dy          = ny,
+                    mouseData   = (uint)delta,
+                    dwFlags     = (isHorizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL)
+                                  | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                }
+            }
+        };
+        SendInput(1, [scrollInput], Marshal.SizeOf<INPUT>());
+        AppDebugLog.Write($"ActionExecutor: scroll physXY=({physX},{physY}) dir={direction} amount={amount}");
+    }
+
+    /// <summary>
+    /// Performs a click-and-drag from (physX1, physY1) to (physX2, physY2).
+    /// Interpolates cursor movement in 10 steps — a single-jump drag is not
+    /// recognised by most applications.
+    /// </summary>
+    public static void Drag(int physX1, int physY1, int physX2, int physY2)
+    {
+        var (nx1, ny1) = Normalise(physX1, physY1);
+        var (nx2, ny2) = Normalise(physX2, physY2);
+
+        // Move to source, pause, hold left button
+        SendInput(1, [MoveInput(nx1, ny1)], Marshal.SizeOf<INPUT>());
+        Thread.Sleep(50);
+        SendInput(1, [MouseButton(nx1, ny1, MOUSEEVENTF_LEFTDOWN)], Marshal.SizeOf<INPUT>());
+        Thread.Sleep(50); // OS needs a hold before drag is recognised
+
+        // Interpolate in 10 steps from source to destination
+        const int steps = 10;
+        for (int i = 1; i <= steps; i++)
+        {
+            int ix = nx1 + (int)((nx2 - nx1) * (i / (double)steps));
+            int iy = ny1 + (int)((ny2 - ny1) * (i / (double)steps));
+            SendInput(1, [MoveInput(ix, iy)], Marshal.SizeOf<INPUT>());
+            Thread.Sleep(15);
+        }
+
+        // Release at destination
+        SendInput(1, [MouseButton(nx2, ny2, MOUSEEVENTF_LEFTUP)], Marshal.SizeOf<INPUT>());
+        AppDebugLog.Write($"ActionExecutor: drag ({physX1},{physY1}) -> ({physX2},{physY2})");
     }
 
     /// <summary>

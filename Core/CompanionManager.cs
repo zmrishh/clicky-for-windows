@@ -112,6 +112,10 @@ public sealed class CompanionManager : IDisposable
 
     private readonly List<(string UserTranscript, string AssistantResponse)> _history = new();
 
+    // ── Long-term memory ──────────────────────────────────────────────────────
+
+    private UserMemory _memory = null!; // initialised in constructor after Settings loads
+
     // ── Fallback delay timer ──────────────────────────────────────────────────
 
     private DispatcherTimer? _finalTranscriptFallbackTimer;
@@ -135,6 +139,7 @@ public sealed class CompanionManager : IDisposable
     public CompanionManager()
     {
         Settings = AppSettings.Load();
+        _memory  = new UserMemory(Settings);
 
         _claudeApi = new ClaudeApi(Settings.WorkerBaseUrl, Settings.SelectedClaudeModel);
         _assemblyAiProvider = new AssemblyAIStreamingProvider(Settings.WorkerBaseUrl);
@@ -1137,10 +1142,15 @@ public sealed class CompanionManager : IDisposable
             ActionTag.Click      c  => c.RightClick ? "right-clicking." : "clicking.",
             ActionTag.DoubleClick _  => "opening that.",
             ActionTag.Hover      _  => "hovering over that.",
+            ActionTag.Scroll     s  => $"scrolling {s.Direction}.",
+            ActionTag.Drag       _  => "dragging that.",
             ActionTag.Type       _  => "typing that for you.",
             ActionTag.Open       o  => $"opening {o.AppName}.",
             ActionTag.Navigate   _  => "navigating there.",
             ActionTag.KeyPress   k  => $"pressing {k.Combo}.",
+            ActionTag.SysInfo    _  => "checking that for you.",
+            ActionTag.Remember   _  => "got it, i'll remember that.",
+            ActionTag.Forget     _  => "done, i'll forget that.",
             null                    => "done.",
             _                       => "on it."
         };
@@ -1212,7 +1222,12 @@ public sealed class CompanionManager : IDisposable
 
             try
             {
-                ExecuteStep(action, captures);
+                ExecuteStep(action, captures, out string? extraSpeech);
+                if (!string.IsNullOrEmpty(extraSpeech))
+                {
+                    WpfApp.Current.Dispatcher.Invoke(() => _overlayManager.ShowResponse(extraSpeech));
+                    await RunTtsAsync(extraSpeech, ct);
+                }
             }
             catch (Exception stepEx)
             {
@@ -1249,10 +1264,15 @@ public sealed class CompanionManager : IDisposable
             ActionTag.Click      c  => c.RightClick ? $"right-clicking...{suffix}" : $"clicking...{suffix}",
             ActionTag.DoubleClick _  => $"opening...{suffix}",
             ActionTag.Hover      _  => $"hovering...{suffix}",
+            ActionTag.Scroll     s  => $"scrolling {s.Direction}...{suffix}",
+            ActionTag.Drag       _  => $"dragging...{suffix}",
             ActionTag.Type       t  => $"typing: {t.Text.Truncate(28)}{suffix}",
             ActionTag.Open       o  => $"opening {o.AppName}...{suffix}",
             ActionTag.Navigate   n  => $"navigating to {n.Url.Truncate(30)}...{suffix}",
             ActionTag.KeyPress   k  => $"pressing {k.Combo}{suffix}",
+            ActionTag.SysInfo    _  => $"checking...{suffix}",
+            ActionTag.Remember   _  => $"remembering...{suffix}",
+            ActionTag.Forget     _  => $"forgetting...{suffix}",
             _                       => $"executing...{suffix}"
         };
     }
@@ -1262,15 +1282,21 @@ public sealed class CompanionManager : IDisposable
         ActionTag.Click      c  => c.RightClick ? $"right-clicked ({c.X},{c.Y})" : $"clicked ({c.X},{c.Y})",
         ActionTag.DoubleClick d => $"double-clicked ({d.X},{d.Y})",
         ActionTag.Hover      h  => $"hovered ({h.X},{h.Y})",
+        ActionTag.Scroll     s  => $"scrolled {s.Direction} x{s.Amount} at ({s.X},{s.Y})",
+        ActionTag.Drag       d  => $"dragged ({d.X1},{d.Y1}) to ({d.X2},{d.Y2})",
         ActionTag.Type       t  => $"typed \"{t.Text.Truncate(20)}\"",
         ActionTag.Open       o  => $"opened {o.AppName}",
         ActionTag.Navigate   n  => $"navigated to {n.Url.Truncate(40)}",
         ActionTag.KeyPress   k  => $"pressed {k.Combo}",
+        ActionTag.SysInfo    s  => $"queried sysinfo:{s.Query}",
+        ActionTag.Remember   r  => $"remembered \"{r.Fact.Truncate(30)}\"",
+        ActionTag.Forget     f  => $"forgot keyword \"{f.Keyword}\"",
         _                       => "executed"
     };
 
-    private static void ExecuteStep(ActionTag action, List<ScreenCaptureData> captures)
+    private void ExecuteStep(ActionTag action, List<ScreenCaptureData> captures, out string? extraSpeech)
     {
+        extraSpeech = null;
         switch (action)
         {
             case ActionTag.Click click:
@@ -1325,6 +1351,62 @@ public sealed class CompanionManager : IDisposable
             case ActionTag.KeyPress key:
                 ActionExecutor.PressKey(key.Combo);
                 break;
+
+            case ActionTag.Scroll scroll:
+            {
+                var ctS = captures.FirstOrDefault(c => c.IsCursorScreen) ?? captures.FirstOrDefault();
+                if (ctS != null)
+                {
+                    double sxS = ctS.PhysicalBounds.Width  / (double)ctS.ScreenshotWidthPx;
+                    double syS = ctS.PhysicalBounds.Height / (double)ctS.ScreenshotHeightPx;
+                    ActionExecutor.Scroll(
+                        ctS.PhysicalBounds.X + (int)(scroll.X * sxS),
+                        ctS.PhysicalBounds.Y + (int)(scroll.Y * syS),
+                        scroll.Direction,
+                        scroll.Amount);
+                }
+                break;
+            }
+
+            case ActionTag.Drag drag:
+            {
+                var ctD = captures.FirstOrDefault(c => c.IsCursorScreen) ?? captures.FirstOrDefault();
+                if (ctD != null)
+                {
+                    double sxD = ctD.PhysicalBounds.Width  / (double)ctD.ScreenshotWidthPx;
+                    double syD = ctD.PhysicalBounds.Height / (double)ctD.ScreenshotHeightPx;
+                    ActionExecutor.Drag(
+                        ctD.PhysicalBounds.X + (int)(drag.X1 * sxD),
+                        ctD.PhysicalBounds.Y + (int)(drag.Y1 * syD),
+                        ctD.PhysicalBounds.X + (int)(drag.X2 * sxD),
+                        ctD.PhysicalBounds.Y + (int)(drag.Y2 * syD));
+                }
+                break;
+            }
+
+            case ActionTag.SysInfo sysInfo:
+            {
+                string result = SystemInfoProvider.Query(sysInfo.Query);
+                extraSpeech = string.IsNullOrEmpty(result)
+                    ? $"sorry, i don't know how to check {sysInfo.Query}"
+                    : result;
+                AppDebugLog.Write($"SysInfo query={sysInfo.Query} result=\"{result}\"");
+                break;
+            }
+
+            case ActionTag.Remember remember:
+                _memory.Add(remember.Fact);
+                extraSpeech = $"got it, i'll remember that.";
+                break;
+
+            case ActionTag.Forget forget:
+            {
+                int removed = _memory.RemoveByKeyword(forget.Keyword);
+                extraSpeech = removed > 0
+                    ? $"done, i've forgotten {removed} fact{(removed > 1 ? "s" : "")} about {forget.Keyword}."
+                    : $"i didn't have anything stored about {forget.Keyword}.";
+                break;
+            }
         }
     }
 
@@ -1552,7 +1634,12 @@ public sealed class CompanionManager : IDisposable
 
     // ── System prompts ────────────────────────────────────────────────────────
 
-    private const string CompanionSystemPrompt = """
+    private string CompanionSystemPrompt => BuildCompanionSystemPrompt();
+
+    private string BuildCompanionSystemPrompt()
+    {
+        string memoryBlock = _memory.ToPromptBlock();
+        return $$"""
         you're clicky, a friendly always-on companion that lives in the user's system tray. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
         rules:
@@ -1607,12 +1694,20 @@ public sealed class CompanionManager : IDisposable
         - [CLICK:x,y:right] — right-click at x,y
         - [DBLCLICK:x,y] — double-click (use this to OPEN files, folders, apps — never single-click to open)
         - [HOVER:x,y] — move cursor to position WITHOUT clicking (use to reveal hidden controls: video players, dropdown menus, tooltips)
+        - [SCROLL:x,y:down:3] — scroll at position x,y. direction = up|down|left|right. amount = number of scroll clicks (default 3). use to scroll pages, feeds, lists, code, chat history.
+        - [DRAG:x1,y1:x2,y2] — click-and-drag from (x1,y1) to (x2,y2). use for moving files, reordering items, resizing windows, dragging sliders.
         - [TYPE:the text to type] — type text into the focused window
         - [OPEN:app name] — launch an application by name (e.g. notepad, chrome, brave, explorer)
         - [NAVIGATE:https://url] — navigate the CURRENT browser tab to a URL (uses Ctrl+L → type URL → Enter). use this instead of opening a new tab.
         - [KEYPRESS:combo] — press a key combo, e.g. Win (open Start), Alt+Tab (switch window), Win+Down (minimize), Win+Up (maximize), Alt+F4 (close), Ctrl+W (close tab), Ctrl+T (new tab), Win+D (show desktop), Enter (confirm/send), Space (play/pause), F5 (refresh)
+        - [SYSINFO:query] — query OS state and speak the result. queries: battery, volume, time, date, wifi. use when user asks "what time is it", "how's my battery", "what's my volume", "am i connected to wifi", etc.
+        - [REMEMBER:fact] — save a fact to long-term memory so you know it in future conversations. use when user says "remember that", "my name is X", "i prefer Y", "i work at Z", etc.
+        - [FORGET:keyword] — remove facts containing the keyword from memory. use when user says "forget that", "clear my name", "forget what i said about X", etc.
         - [WAIT:ms] — pause for ms milliseconds before the next step
         - [DONE] — signal that the full multi-step task is now complete
+
+        screen reading:
+        when the user asks "what's on screen?", "read that for me", "what does it say?", "describe what you see", or similar — just describe what you see in natural spoken language. be concise and specific: focus on what's relevant to their context, not a full inventory of every pixel. end with [POINT:none].
 
         IMPORTANT for video players (Netflix, YouTube, Prime Video, etc.):
         - video controls (play, pause, seek bar) are HIDDEN until the mouse hovers over the video.
@@ -1668,7 +1763,9 @@ public sealed class CompanionManager : IDisposable
         CRITICAL: always write spoken text first — never start with a tag. coordinates must come from what you actually see in the screenshot. pick the center of the element you're targeting.
 
         you can also combine with a POINT tag: spoken text → action tags → [POINT:x,y:label] at the very end.
+        {{memoryBlock}}
         """;
+    }
 
     private const string AgentStepSystemPrompt = """
         you are clicky's action agent — you're mid-way through executing a multi-step task the user requested. you can see the current screen state. your job is to determine the single next action.
@@ -1703,10 +1800,15 @@ public sealed class CompanionManager : IDisposable
         - [CLICK:x,y:right] — right-click
         - [DBLCLICK:x,y] — double-click — USE THIS to open folders, files, and apps in File Explorer or desktop. a single CLICK only selects, it does NOT open.
         - [HOVER:x,y] — move cursor WITHOUT clicking — use to reveal hidden controls (video player controls, tooltips, dropdowns). always hover first, wait, then click.
+        - [SCROLL:x,y:down:3] — scroll at position x,y. direction = up|down|left|right, amount = scroll clicks. use to scroll pages, feeds, lists, code editors.
+        - [DRAG:x1,y1:x2,y2] — click-and-drag from (x1,y1) to (x2,y2). use for moving files, reordering, dragging sliders.
         - [TYPE:text] — type into focused window
         - [OPEN:app] — launch application by name
         - [NAVIGATE:https://url] — navigate current browser tab to a URL (Ctrl+L → type → Enter). NEVER open new tabs just to navigate.
         - [KEYPRESS:combo] — keyboard shortcut (e.g. Win=open Start, Alt+Tab=switch window, Win+Down=minimize, Win+Up=maximize, Alt+F4=close window, Ctrl+W=close tab, Enter=confirm/send, Space=play/pause, F5=refresh)
+        - [SYSINFO:query] — query battery, volume, time, date, or wifi and speak the answer. only use in response to a user question about system state, not mid-task.
+        - [REMEMBER:fact] — save a user fact to long-term memory (use when explicitly asked to remember something).
+        - [FORGET:keyword] — remove facts with this keyword from memory.
         - [WAIT:ms] — pause ms milliseconds
         - [DONE] — task complete, stop
 

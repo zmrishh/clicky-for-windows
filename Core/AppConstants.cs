@@ -56,6 +56,10 @@ internal static class AppConstants
     /// <summary>Extra pause after a Navigate action before re-screenshotting (pages take longer to load).</summary>
     public const int NavigateStepPauseMs = 1800;
 
+    // Memory
+    /// <summary>Maximum number of user facts stored in long-term memory before oldest is evicted.</summary>
+    public const int MemoryMaxFacts = 30;
+
     // Persistence
     public const string SettingsFileName = "settings.json";
     public static string SettingsDirectory =>
